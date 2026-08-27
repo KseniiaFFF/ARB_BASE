@@ -1,12 +1,19 @@
 from dataclasses import dataclass
 
 
-@dataclass
-class Market:
-    base: str
-    quote: str
-    symbol: str
+@dataclass(slots=True)
+class Price:
+    asset: str
     exchange: str
-    volume_24h: float
-    active: bool
-    contract_type: str
+    symbol: str
+
+    bid: float
+    ask: float
+
+    bid_qty: float
+    ask_qty: float
+
+    timestamp: int
+
+    received_at: int
+    received_at_ns: int

@@ -36,7 +36,7 @@ def build_universe() -> dict[str, list[Market]]:
         if market.volume_24h < MIN_VOLUME_BINANCE:
             continue
 
-        markets_by_coin[market.base] = [market]
+        markets_by_coin[market.asset] = [market]
 
 
     for exchange_name in ("bitget", "okx"):
@@ -46,15 +46,15 @@ def build_universe() -> dict[str, list[Market]]:
             if not market.active:
                 continue
 
-            if market.base not in markets_by_coin:
+            if market.asset not in markets_by_coin:
                 continue
 
-            markets_by_coin[market.base].append(market)
+            markets_by_coin[market.asset].append(market)
 
 
     return {
-        coin: markets
-        for coin, markets in markets_by_coin.items()
+        asset: markets
+        for asset, markets in markets_by_coin.items()
         if len(markets) >= 2
     }
 

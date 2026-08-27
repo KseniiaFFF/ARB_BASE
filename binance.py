@@ -43,6 +43,7 @@ def get_futures_markets() -> list[Market]:
 
         markets.append(
             Market(
+                asset=symbol[:-4],
                 base=symbol[:-4],
                 quote="USDT",
                 symbol=symbol,

@@ -11,14 +11,14 @@ from exchanges.okx import (
 )
 
 from log_settings import setup_logging
-from models import Market
+from models import Contract, Market
 
 setup_logging()
 
 logger = logging.getLogger(__name__)
 
 
-def get_valid_binance_contracts() -> set[str]:
+def get_valid_binance_contracts() -> dict[str, Contract]:
 
     try:
         contracts = get_binance_contracts()
@@ -28,7 +28,7 @@ def get_valid_binance_contracts() -> set[str]:
             len(contracts)
         )
 
-        valid_contracts = set()
+        valid_contracts = {}
 
         for contract in contracts:
 
@@ -50,7 +50,21 @@ def get_valid_binance_contracts() -> set[str]:
                 )
                 continue
 
-            valid_contracts.add(symbol)
+            contract_size = 1.0
+
+            valid_contracts[symbol] = Contract(
+                exchange="binance",
+                symbol=symbol,
+                asset=symbol[:-4],
+                quote="USDT",
+                contract_type="perpetual",
+                active=True,
+                contract_size=contract_size,
+                contract_size_currency=contract.get(
+                    "baseAsset",
+                    symbol[:-4]
+                ),
+            )
 
         logger.info(
             "Binance: действующих USDT perpetual контрактов: %d",
@@ -64,10 +78,10 @@ def get_valid_binance_contracts() -> set[str]:
             "Ошибка при получении/проверке контрактов Binance"
         )
 
-        return set()
+        return {}
 
 
-def get_valid_bitget_contracts() -> set[str]:
+def get_valid_bitget_contracts() -> dict[str, Contract]:
 
     try:
         contracts = get_bitget_contracts()
@@ -77,7 +91,7 @@ def get_valid_bitget_contracts() -> set[str]:
             len(contracts)
         )
 
-        valid_contracts = set()
+        valid_contracts = {}
 
         for contract in contracts:
 
@@ -96,7 +110,22 @@ def get_valid_bitget_contracts() -> set[str]:
                 )
                 continue
 
-            valid_contracts.add(symbol)
+            base = symbol[:-4]
+
+            contract_size = float(
+                contract.get("sizeMultiplayer", 1)
+            )
+
+            valid_contracts[symbol] = Contract(
+                exchange="bitget",
+                symbol=symbol,
+                asset=base,
+                quote="USDT",
+                contract_type="perpetual",
+                active=True,
+                contract_size=contract_size,
+                contract_size_currency=base,
+            )
 
         logger.info(
             "Bitget: действующих USDT perpetual контрактов: %d",
@@ -110,10 +139,10 @@ def get_valid_bitget_contracts() -> set[str]:
             "Ошибка при получении/проверке контрактов Bitget"
         )
 
-        return set()
+        return {}
 
 
-def get_valid_okx_contracts() -> set[str]:
+def get_valid_okx_contracts() -> dict[str, Contract]:
 
     try:
         contracts = get_okx_contracts()
@@ -123,7 +152,7 @@ def get_valid_okx_contracts() -> set[str]:
             len(contracts)
         )
 
-        valid_contracts = set()
+        valid_contracts = {}
 
         for contract in contracts:
 
@@ -138,7 +167,27 @@ def get_valid_okx_contracts() -> set[str]:
             if contract.get("state") != "live":
                 continue
 
-            valid_contracts.add(symbol)
+            base = symbol.split("-")[0]
+
+            ct_val = float(
+                contract.get("ctVal", 0)
+            )
+
+            ct_val_ccy = contract.get(
+                "ctValCcy",
+                base
+            )
+
+            valid_contracts[symbol] = Contract(
+                exchange="okx",
+                symbol=symbol,
+                asset=base,
+                quote="USDT",
+                contract_type="perpetual",
+                active=True,
+                contract_size=ct_val,
+                contract_size_currency=ct_val_ccy,
+            )
 
         logger.info(
             "OKX: действующих USDT perpetual контрактов: %d",
@@ -152,10 +201,10 @@ def get_valid_okx_contracts() -> set[str]:
             "Ошибка при получении/проверке контрактов OKX"
         )
 
-        return set()
+        return {}
 
 
-def get_valid_contracts() -> dict[str, set[str]]:
+def get_valid_contracts() -> dict[str, dict[str, Contract]]:
 
     logger.info(
         "Начало проверки действующих контрактов"
@@ -176,17 +225,21 @@ def get_valid_contracts() -> dict[str, set[str]]:
 
 def update_market_status(
     markets: list[Market],
-    valid_contracts: dict[str, set[str]]
+    valid_contracts: dict[str, dict[str, Contract]]
 ) -> None:
 
     for market in markets:
 
         exchange_contracts = valid_contracts.get(
             market.exchange,
-            set()
+            {}
         )
 
-        market.active = market.symbol in exchange_contracts
+        contract = exchange_contracts.get(
+            market.symbol
+        )
+
+        market.active = contract is not None
 
         logger.debug(
             "%s %s: active=%s",
@@ -198,7 +251,7 @@ def update_market_status(
 
 def update_all_market_status(
     exchanges: dict[str, list[Market]],
-    valid_contracts: dict[str, set[str]]
+    valid_contracts: dict[str, dict[str, Contract]]
 ) -> None:
 
     for exchange, markets in exchanges.items():
@@ -229,15 +282,21 @@ if __name__ == "__main__":
 
     contracts = get_valid_contracts()
 
-    for exchange, symbols in contracts.items():
+    for exchange, exchange_contracts in contracts.items():
 
         print(
             f"{exchange}: "
-            f"{len(symbols)} действующих контрактов"
+            f"{len(exchange_contracts)} действующих контрактов"
         )
 
-        for symbol in sorted(symbols):
-            print(f"  {symbol}")
+        for symbol, contract in sorted(
+            exchange_contracts.items()
+            ):
+            print(
+                f"  {symbol:20}"
+                f"size={contract.contract_size}"
+                f"  {contract.contract_size_currency}"
+                )
 
         print()
 

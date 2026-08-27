@@ -1,7 +1,10 @@
 import requests
+import logging
 
 from models import Market
 from config import BASE_URL_OKX
+
+logger = logging.getLogger(__name__)
 
 
 def get_futures_contracts() -> list[dict]:
@@ -61,7 +64,22 @@ def get_futures_markets() -> list[Market]:
 
         base = symbol.split("-")[0]
 
-        last_price = float(ticker["last"])
+        last = ticker.get("last")
+
+        if not last:
+            continue
+
+        try:
+
+            last_price = float(last)
+
+        except (TypeError, ValueError):
+            logger.warning(
+                "OKX: некорректный last price: %r | ticker=%s",
+                last,
+                ticker,
+            )
+            continue
 
         volume_base = float(ticker["volCcy24h"])
 
@@ -69,6 +87,7 @@ def get_futures_markets() -> list[Market]:
 
         markets.append(
             Market(
+                asset=base,
                 base=base,
                 quote="USDT",
                 symbol=symbol,
