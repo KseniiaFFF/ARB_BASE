@@ -6,7 +6,7 @@ from config import MIN_PERCENT, PRICE_MAX_AGE_MS, MAX_TIMESTAMP_DIFF_MS
 
 from market_universe import build_universe
 
-from price_feeds.models import Price
+from price_feeds.models_price import Price
 
 from price_feeds.binance_ws import run_binance_ws
 from price_feeds.bitget_ws import run_bitget_ws

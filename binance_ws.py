@@ -4,7 +4,7 @@ import logging
 import time
 import websockets
 
-from price_feeds.models import Price
+from price_feeds.models_price import Price
 
 
 logger = logging.getLogger(__name__)
