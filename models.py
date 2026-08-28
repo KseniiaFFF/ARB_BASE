@@ -11,8 +11,11 @@ class Contract:
     active: bool
 
     contract_size: float
-
     contract_size_currency: str
+
+    min_qty: float
+    max_qty: float
+    qty_step: float
 
 
 @dataclass

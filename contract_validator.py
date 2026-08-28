@@ -50,7 +50,51 @@ def get_valid_binance_contracts() -> dict[str, Contract]:
                 )
                 continue
 
-            contract_size = 1.0
+            # contract_size = 1.0
+
+            # valid_contracts[symbol] = Contract(
+            #     exchange="binance",
+            #     symbol=symbol,
+            #     asset=symbol[:-4],
+            #     quote="USDT",
+            #     contract_type="perpetual",
+            #     active=True,
+            #     contract_size=contract_size,
+            #     contract_size_currency=contract.get(
+            #         "baseAsset",
+            #         symbol[:-4]
+            #     ),
+            # )
+            filters = {
+                item["filterType"]: item
+                for item in contract.get("filters", [])
+            }
+
+            lot_size = filters.get("LOT_SIZE")
+            market_lot_size = filters.get("MARKET_LOT_SIZE")
+
+            if market_lot_size:
+                qty_filter = market_lot_size
+            elif lot_size:
+                qty_filter = lot_size
+            else:
+                logger.warning(
+                    "Binance: нет quantity filter: %s",
+                    symbol,
+                )
+                continue
+
+            min_qty = float(
+                qty_filter["minQty"]
+            )
+
+            max_qty = float(
+                qty_filter["maxQty"]
+            )
+
+            qty_step = float(
+                qty_filter["stepSize"]
+            )
 
             valid_contracts[symbol] = Contract(
                 exchange="binance",
@@ -59,11 +103,17 @@ def get_valid_binance_contracts() -> dict[str, Contract]:
                 quote="USDT",
                 contract_type="perpetual",
                 active=True,
-                contract_size=contract_size,
+
+                contract_size=1.0,
+
                 contract_size_currency=contract.get(
                     "baseAsset",
                     symbol[:-4]
                 ),
+
+                min_qty=min_qty,
+                max_qty=max_qty,
+                qty_step=qty_step,
             )
 
         logger.info(
@@ -113,7 +163,19 @@ def get_valid_bitget_contracts() -> dict[str, Contract]:
             base = symbol[:-4]
 
             contract_size = float(
-                contract.get("sizeMultiplayer", 1)
+                contract.get("sizeMultiplier", 1)
+            )
+
+            min_qty = float(
+                contract.get("minTradeNum", 0)
+            )
+
+            max_qty = float(
+                contract.get("maxOrderQty", 0)
+            )
+
+            qty_step = float(
+                contract.get("sizeMultiplier", 1)
             )
 
             valid_contracts[symbol] = Contract(
@@ -123,8 +185,13 @@ def get_valid_bitget_contracts() -> dict[str, Contract]:
                 quote="USDT",
                 contract_type="perpetual",
                 active=True,
+
                 contract_size=contract_size,
                 contract_size_currency=base,
+
+                min_qty=min_qty,
+                max_qty=max_qty,
+                qty_step=qty_step,
             )
 
         logger.info(
@@ -178,6 +245,18 @@ def get_valid_okx_contracts() -> dict[str, Contract]:
                 base
             )
 
+            min_qty = float(
+                contract.get("minSz", 0)
+            )
+
+            qty_step = float(
+                contract.get("lotSz", 1)
+            )
+
+            max_qty = float(
+                contract.get("maxLmtSz", 0)
+            )
+
             valid_contracts[symbol] = Contract(
                 exchange="okx",
                 symbol=symbol,
@@ -185,8 +264,13 @@ def get_valid_okx_contracts() -> dict[str, Contract]:
                 quote="USDT",
                 contract_type="perpetual",
                 active=True,
+
                 contract_size=ct_val,
                 contract_size_currency=ct_val_ccy,
+
+                min_qty=min_qty,
+                max_qty=max_qty,
+                qty_step=qty_step,
             )
 
         logger.info(
@@ -294,7 +378,10 @@ if __name__ == "__main__":
             ):
             print(
                 f"  {symbol:20}"
-                f"size={contract.contract_size}"
+                f" size={contract.contract_size}"
+                f" min_qty={contract.min_qty}"
+                f" max_qty={contract.max_qty}"
+                f" qty_step={contract.qty_step}"
                 f"  {contract.contract_size_currency}"
                 )
 

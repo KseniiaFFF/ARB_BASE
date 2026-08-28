@@ -11,6 +11,12 @@ from price_feeds.models_price import Price
 from price_feeds.binance_ws import run_binance_ws
 from price_feeds.bitget_ws import run_bitget_ws
 from price_feeds.okx_ws import run_okx_ws
+from profitability.fees import get_fee
+from contract_validator import get_valid_contracts
+from profitability.position_size import (
+    get_position_notional,
+    calculate_position,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -118,6 +124,7 @@ def get_processing_age_ms(price: Price) -> float | None:
 
 def find_arbitrage_opportunities(
     universe: dict[str, list],
+    contracts: dict[str, dict],
 ) -> list[dict]:
 
     opportunities = []
@@ -138,6 +145,16 @@ def find_arbitrage_opportunities(
 
             buy_price = prices[buy_exchange]
 
+            buy_contract = contracts.get(
+                buy_exchange,
+                {},
+            ).get(
+                buy_price.symbol
+            )
+
+            if buy_contract is None:
+                continue
+
             if not is_price_fresh(buy_price):
                 continue
 
@@ -152,6 +169,16 @@ def find_arbitrage_opportunities(
                     continue
 
                 sell_price = prices[sell_exchange]
+
+                sell_contract = contracts.get(
+                    sell_exchange,
+                    {},
+                ).get(
+                    sell_price.symbol
+                )
+
+                if sell_contract is None:
+                    continue
 
                 if not is_price_fresh(sell_price):
                     continue
@@ -171,11 +198,50 @@ def find_arbitrage_opportunities(
                 if sell <= 0:
                     continue
 
+                position_notional = get_position_notional()
+
+                buy_position = calculate_position(
+                    notional_usdt=position_notional,
+                    price=buy,
+                    contract=buy_contract,
+                )
+
+                sell_position = calculate_position(
+                    notional_usdt=position_notional,
+                    price=sell,
+                    contract=sell_contract,
+                )
+
+                if not buy_position["possible"]:
+                    continue
+
+                if not sell_position["possible"]:
+                    continue
+
                 spread_percent = (
                     (sell / buy) - 1
                 ) * 100
 
-                if spread_percent < MIN_PERCENT:
+                buy_fee_percent = get_fee(
+                    buy_exchange,
+                    buy_price.symbol,
+                )
+
+                sell_fee_percent = get_fee(
+                    sell_exchange,
+                    sell_price.symbol,
+                )
+
+                total_fee_percent = (
+                    buy_fee_percent * 2 + sell_fee_percent * 2
+                )
+
+
+                net_profit_percent = (
+                    spread_percent - total_fee_percent
+                )
+
+                if net_profit_percent < MIN_PERCENT:
                     continue
 
 
@@ -192,6 +258,27 @@ def find_arbitrage_opportunities(
                         "sell_price": sell,
 
                         "spread_percent": spread_percent,
+
+                        "position_notional": position_notional,
+
+                        "buy_quantity": buy_position["quantity"],
+                        "buy_actual_notional": buy_position["actual_notional"],
+
+                        "sell_quantity": sell_position["quantity"],
+                        "sell_actual_notional": sell_position["actual_notional"],
+
+                        "buy_contract_size": buy_contract.contract_size,
+                        "buy_contract_size_currency": buy_contract.contract_size_currency,
+
+                        "sell_contract_size": sell_contract.contract_size,
+                        "sell_contract_size_currency": sell_contract.contract_size_currency,
+
+                        "buy_fee_percent": buy_fee_percent,
+                        "sell_fee_percent": sell_fee_percent,
+
+                        "total_fee_percent": total_fee_percent,
+
+                        "net_profit_percent": net_profit_percent,
 
                         "buy_qty": buy_price.ask_qty,
                         "sell_qty": sell_price.bid_qty,
@@ -249,8 +336,33 @@ def print_opportunity(
     )
 
     print(
-        f"Spread:              "
-        f"{opportunity['spread_percent']:.4f}%"
+    f"Net profit:           "
+    f"{opportunity['net_profit_percent']:.4f}%"
+    )
+
+    print(
+    f"Position notional:  "
+    f"{opportunity['position_notional']:.8f} USDT"
+)
+
+    print(
+        f"Buy quantity:       "
+        f"{opportunity['buy_quantity']:.12f}"
+    )
+
+    print(
+        f"Buy actual notional:"
+        f" {opportunity['buy_actual_notional']:.8f} USDT"
+    )
+
+    print(
+        f"Sell quantity:      "
+        f"{opportunity['sell_quantity']:.12f}"
+    )
+
+    print(
+        f"Sell actual notional:"
+        f" {opportunity['sell_actual_notional']:.8f} USDT"
     )
 
     print(
@@ -288,15 +400,6 @@ def print_opportunity(
         f"{opportunity['sell_age_ms']} ms"
     )
 
-    # print(
-    #     f"Buy latency:         "
-    #     f"{opportunity['buy_latency_ms']} ms"
-    # )
-
-    # print(
-    #     f"Sell latency:        "
-    #     f"{opportunity['sell_latency_ms']} ms"
-    # )
     print(
             f"Buy_processing_age_ms:             "
             f"{opportunity["buy_processing_age_ms"]} ms"
@@ -319,17 +422,26 @@ def print_opportunity(
 
 
 async def monitor(
-    universe: dict[str, list]
+    universe: dict[str, list],
+    contracts: dict[str, dict]
 ) -> None:
 
     logger.info(
         "Запуск мониторинга цен"
     )
 
-    last_signals: dict[
-        tuple[str, str, str],
-        float
-    ] = {}
+    # last_signals: dict[
+    #     tuple[str, str, str],
+    #     # float
+    #     int
+    # ] = {}
+    last_signal_time: dict[
+            tuple[str, str, str],
+            # float
+            int
+        ] = {}
+
+    SIGNAL_COOLDOWN_MS = 20_000
 
     while True:
 
@@ -337,7 +449,8 @@ async def monitor(
 
             opportunities = (
                 find_arbitrage_opportunities(
-                    universe
+                    universe,
+                    contracts,
                 )
             )
 
@@ -349,56 +462,70 @@ async def monitor(
                     opportunity["sell_exchange"],
                 )
 
-                spread = (
-                    opportunity["spread_percent"]
+                now_ms = int(
+                    time.time() * 1000
                 )
 
-                previous = last_signals.get(key)
+                last_time = last_signal_time.get(key)
 
                 if (
-                    previous is None
-                    or abs(spread - previous) >= 0.01
+                    last_time is not None
+                    and now_ms - last_time < SIGNAL_COOLDOWN_MS
                 ):
+                    continue
 
-                    print_opportunity(
-                        opportunity
-                    )
+                # spread = (
+                #     opportunity["spread_percent"]
+                # )
 
-                    logger.info(
-                        "Arbitrage: %s | "
-                        "BUY %s %.8f | "
-                        "SELL %s %.8f | "
-                        "spread=%.4f%% | "
-                        "timestamp_diff=%dms | "
-                        "buy_age=%dms | "
-                        "sell_age=%dms | "
-                        # "buy_latency=%dms | "
-                        # "sell_latency=%dms",
-                        "buy_processing_age=%sms | "
-                        "sell_processing_age=%sms",
-                        
-                        opportunity["asset"],
+                # previous = last_signals.get(key)
 
-                        opportunity["buy_exchange"],
-                        opportunity["buy_price"],
+                # if (
+                #     previous is None
+                #     or abs(spread - previous) >= 0.01
+                # ):
 
-                        opportunity["sell_exchange"],
-                        opportunity["sell_price"],
+                print_opportunity(
+                    opportunity
+                )
 
-                        opportunity["spread_percent"],
+                logger.info(
+                    "Arbitrage: %s | "
+                    "BUY %s %.8f | "
+                    "SELL %s %.8f | "
+                    "spread=%.4f%% | "
+                    "timestamp_diff=%dms | "
+                    "buy_age=%dms | "
+                    "sell_age=%dms | "
+                    # "buy_latency=%dms | "
+                    # "sell_latency=%dms",
+                    "buy_processing_age=%sms | "
+                    "sell_processing_age=%sms",
+                    
+                    opportunity["asset"],
 
-                        opportunity["timestamp_diff_ms"],
+                    opportunity["buy_exchange"],
+                    opportunity["buy_price"],
 
-                        opportunity["buy_age_ms"],
-                        opportunity["sell_age_ms"],
+                    opportunity["sell_exchange"],
+                    opportunity["sell_price"],
 
-                        # opportunity["buy_latency_ms"],
-                        # opportunity["sell_latency_ms"],
-                        opportunity["buy_processing_age_ms"],
-                        opportunity["sell_processing_age_ms"],
-                    )
+                    opportunity["spread_percent"],
 
-                    last_signals[key] = spread
+                    opportunity["timestamp_diff_ms"],
+
+                    opportunity["buy_age_ms"],
+                    opportunity["sell_age_ms"],
+
+                    # opportunity["buy_latency_ms"],
+                    # opportunity["sell_latency_ms"],
+                    opportunity["buy_processing_age_ms"],
+                    opportunity["sell_processing_age_ms"],
+                )
+
+                last_signal_time[key] = now_ms
+
+                # last_signals[key] = spread
 
             await asyncio.sleep(0.02)
 
@@ -431,6 +558,8 @@ async def main() -> None:
         "Universe сформирован: %d монет",
         len(universe)
     )
+
+    contracts = get_valid_contracts()
 
     print(
         f"Universe: {len(universe)} монет"
@@ -490,7 +619,7 @@ async def main() -> None:
 
 
     monitor_task = asyncio.create_task(
-        monitor(universe)
+        monitor(universe, contracts,)
     )
 
     try:
