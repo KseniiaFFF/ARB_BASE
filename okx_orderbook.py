@@ -7,26 +7,38 @@ import time
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from price_feeds.orderbook_models import OrderBook
+from price_feeds.orderbook_cache import update_orderbook
+
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
 
 CHANNEL = "books"
 
 PRINT_LEVELS = 10
-
 PRINT_INTERVAL = 1.0
 
+RECONNECT_DELAY = 2
+MAX_RECONNECT_DELAY = 60
+
 
 # ============================================================
-# ORDER BOOK
+# INTERNAL ORDER BOOK
 # ============================================================
 
-class OKXOrderBook:
+class OKXLocalOrderBook:
 
-    def __init__(self, symbol: str):
+    def __init__(
+        self,
+        symbol: str,
+    ) -> None:
 
         self.symbol = symbol
 
@@ -37,12 +49,16 @@ class OKXOrderBook:
 
         self.events = 0
 
-        self.snapshot_received = False
+        self.synced = False
+
+        self.last_timestamp = 0
+        self.last_received_at = 0
+        self.last_received_at_ns = 0
 
         self.last_print = 0.0
 
     # ========================================================
-    # SNAPSHOT
+    # LOAD SNAPSHOT
     # ========================================================
 
     def load_snapshot(
@@ -50,46 +66,60 @@ class OKXOrderBook:
         data: dict,
     ) -> None:
 
-        print("load_snapshot")
-
         self.bids.clear()
         self.asks.clear()
 
-        for level in data.get("bids", []):
+        for level in data.get(
+            "bids",
+            [],
+        ):
 
             if len(level) < 2:
                 continue
 
             try:
+
                 price = float(level[0])
                 quantity = float(level[1])
+
             except (
                 TypeError,
                 ValueError,
             ):
+
                 continue
 
             if quantity > 0:
+
                 self.bids[price] = quantity
 
-        for level in data.get("asks", []):
+        for level in data.get(
+            "asks",
+            [],
+        ):
 
             if len(level) < 2:
                 continue
 
             try:
+
                 price = float(level[0])
                 quantity = float(level[1])
+
             except (
                 TypeError,
                 ValueError,
             ):
+
                 continue
 
             if quantity > 0:
+
                 self.asks[price] = quantity
 
-        seq_id = data.get("seqId")
+        seq_id = data.get(
+            "seqId"
+        )
 
         if seq_id is None:
 
@@ -98,11 +128,40 @@ class OKXOrderBook:
                 "snapshot не содержит seqId"
             )
 
-        self.seq_id = int(seq_id)
+        self.seq_id = int(
+            seq_id
+        )
 
-        self.snapshot_received = True
+        # OKX snapshot содержит ts.
+        timestamp = data.get(
+            "ts"
+        )
+
+        if timestamp is not None:
+
+            try:
+
+                self.last_timestamp = int(
+                    timestamp
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                self.last_timestamp = 0
+
+        self.last_received_at_ns = (
+            time.time_ns()
+        )
+
+        self.last_received_at = (
+            self.last_received_at_ns // 1_000_000
+        )
 
         self.events = 1
+        self.synced = True
 
         logger.info(
             "OKX OrderBook %s: "
@@ -115,7 +174,7 @@ class OKXOrderBook:
         )
 
     # ========================================================
-    # UPDATE
+    # APPLY UPDATE
     # ========================================================
 
     def apply_update(
@@ -123,9 +182,7 @@ class OKXOrderBook:
         data: dict,
     ) -> None:
 
-        print("apply_update")
-
-        if not self.snapshot_received:
+        if not self.synced:
 
             raise RuntimeError(
                 "Update получен до snapshot"
@@ -181,206 +238,336 @@ class OKXOrderBook:
         # APPLY BIDS
         # ====================================================
 
-        self.apply_levels(
+        apply_levels(
             self.bids,
-            data.get("bids", []),
+            data.get(
+                "bids",
+                [],
+            ),
         )
 
         # ====================================================
         # APPLY ASKS
         # ====================================================
 
-        self.apply_levels(
+        apply_levels(
             self.asks,
-            data.get("asks", []),
+            data.get(
+                "asks",
+                [],
+            ),
         )
+
+        # ====================================================
+        # UPDATE METADATA
+        # ====================================================
 
         self.seq_id = new_seq_id
 
-        self.events += 1
+        timestamp = data.get(
+            "ts"
+        )
 
-    # ========================================================
-    # APPLY LEVELS
-    # ========================================================
-
-    @staticmethod
-    def apply_levels(
-        book: dict[float, float],
-        levels: list,
-    ) -> None:
-
-        print("apply_levels")
-
-        for level in levels:
-
-            if len(level) < 2:
-                continue
+        if timestamp is not None:
 
             try:
-                price = float(level[0])
-                quantity = float(level[1])
+
+                self.last_timestamp = int(
+                    timestamp
+                )
+
             except (
                 TypeError,
                 ValueError,
             ):
-                continue
 
-            if quantity == 0:
+                pass
 
-                book.pop(
-                    price,
-                    None,
-                )
-
-            else:
-
-                book[price] = quantity
-
-    # ========================================================
-    # BEST BID
-    # ========================================================
-
-    def best_bid(self) -> float | None:
-
-        if not self.bids:
-            return None
-
-        return max(
-            self.bids
+        self.last_received_at_ns = (
+            time.time_ns()
         )
 
-    # ========================================================
-    # BEST ASK
-    # ========================================================
-
-    def best_ask(self) -> float | None:
-
-        if not self.asks:
-            return None
-
-        return min(
-            self.asks
+        self.last_received_at = (
+            self.last_received_at_ns // 1_000_000
         )
 
-    # ========================================================
-    # PRINT ORDER BOOK
-    # ========================================================
+        self.events += 1
 
-    def print_book(self) -> None:
 
-        print(
-            "\n"
-            + "=" * 60
-        )
+# ============================================================
+# APPLY LEVELS
+# ============================================================
 
-        print(
-            f"OKX FUTURES ORDER BOOK: "
-            f"{self.symbol}"
-        )
+def apply_levels(
+    book: dict[float, float],
+    levels: list,
+) -> None:
 
-        print(
-            f"Sequence ID:       "
-            f"{self.seq_id}"
-        )
+    for level in levels:
 
-        print(
-            f"Events:            "
-            f"{self.events}"
-        )
+        if len(level) < 2:
+            continue
 
-        best_bid = self.best_bid()
-        best_ask = self.best_ask()
+        try:
 
-        if (
-            best_bid is not None
-            and best_ask is not None
+            price = float(level[0])
+            quantity = float(level[1])
+
+        except (
+            TypeError,
+            ValueError,
         ):
 
-            spread = (
-                best_ask - best_bid
+            continue
+
+        if quantity == 0:
+
+            book.pop(
+                price,
+                None,
             )
 
-            mid = (
-                best_ask + best_bid
-            ) / 2
+        else:
 
-            spread_percent = (
-                spread / mid * 100
-                if mid
-                else 0
-            )
+            book[price] = quantity
 
-            print(
-                f"Spread:            "
-                f"{spread:.8f} "
-                f"({spread_percent:.6f}%)"
-            )
 
-        print(
-            "-" * 60
+# ============================================================
+# BUILD COMMON ORDERBOOK
+# ============================================================
+
+def build_common_orderbook(
+    orderbook: OKXLocalOrderBook,
+) -> OrderBook:
+
+    if orderbook.seq_id is None:
+
+        raise RuntimeError(
+            "Cannot build common OrderBook "
+            "without seq_id"
         )
 
-        # ====================================================
-        # ASKS
-        # ====================================================
+    return OrderBook(
+        exchange="okx",
+        symbol=orderbook.symbol,
 
-        print("ASKS")
-
-        asks = sorted(
-            self.asks.items()
-        )[:PRINT_LEVELS]
-
-        for price, quantity in asks:
-
-            print(
-                f"  {price:14.8f}"
-                f"  {quantity:18.8f}"
-            )
-
-        print(
-            "-" * 60
-        )
-
-        # ====================================================
-        # BIDS
-        # ====================================================
-
-        print("BIDS")
-
-        bids = sorted(
-            self.bids.items(),
+        bids=sorted(
+            orderbook.bids.items(),
             reverse=True,
-        )[:PRINT_LEVELS]
+        ),
 
-        for price, quantity in bids:
+        asks=sorted(
+            orderbook.asks.items()
+        ),
 
-            print(
-                f"  {price:14.8f}"
-                f"  {quantity:18.8f}"
-            )
+        timestamp=orderbook.last_timestamp,
+
+        received_at=orderbook.last_received_at,
+
+        received_at_ns=orderbook.last_received_at_ns,
+
+        update_id=orderbook.seq_id,
+    )
+
+
+# ============================================================
+# PUBLISH TO CACHE
+# ============================================================
+
+def publish_orderbook(
+    orderbook: OKXLocalOrderBook,
+) -> None:
+
+    common_orderbook = (
+        build_common_orderbook(
+            orderbook
+        )
+    )
+
+    update_orderbook(
+        common_orderbook
+    )
+
+
+# ============================================================
+# BEST BID / ASK
+# ============================================================
+
+def get_best_bid(
+    orderbook: OKXLocalOrderBook,
+) -> tuple[float, float] | None:
+
+    if not orderbook.bids:
+        return None
+
+    price = max(
+        orderbook.bids
+    )
+
+    return (
+        price,
+        orderbook.bids[price],
+    )
+
+
+def get_best_ask(
+    orderbook: OKXLocalOrderBook,
+) -> tuple[float, float] | None:
+
+    if not orderbook.asks:
+        return None
+
+    price = min(
+        orderbook.asks
+    )
+
+    return (
+        price,
+        orderbook.asks[price],
+    )
+
+
+# ============================================================
+# PRINT ORDERBOOK
+# ============================================================
+
+def print_orderbook(
+    orderbook: OKXLocalOrderBook,
+) -> None:
+
+    if not orderbook.synced:
 
         print(
-            "=" * 60
+            f"{orderbook.symbol}: "
+            "NOT SYNCED"
         )
 
+        return
+
+    best_bid = get_best_bid(
+        orderbook
+    )
+
+    best_ask = get_best_ask(
+        orderbook
+    )
+
+    if not best_bid or not best_ask:
+
+        print(
+            f"{orderbook.symbol}: "
+            "стакан пуст"
+        )
+
+        return
+
+    # bid_price, bid_quantity = best_bid
+    # ask_price, ask_quantity = best_ask
+
+    # spread = (
+    #     ask_price - bid_price
+    # )
+
+    # spread_percent = (
+    #     spread / bid_price * 100
+    #     if bid_price
+    #     else 0
+    # )
+
+    # print()
+    # print(
+    #     "=================================================="
+    # )
+
+    # print(
+    #     f"OKX FUTURES ORDER BOOK: "
+    #     f"{orderbook.symbol}"
+    # )
+
+    # print(
+    #     f"Update ID: {orderbook.seq_id}"
+    # )
+
+    # print(
+    #     f"Events:    {orderbook.events}"
+    # )
+
+    # print(
+    #     f"Spread:    "
+    #     f"{spread:.8f} "
+    #     f"({spread_percent:.6f}%)"
+    # )
+
+    # print(
+    #     "--------------------------------------------------"
+    # )
+
     # ========================================================
-    # PRINT TIMER
+    # ASKS
     # ========================================================
 
-    def should_print(self) -> bool:
+    # print("ASKS")
 
-        now = time.monotonic()
+    # asks = sorted(
+    #     orderbook.asks.items()
+    # )[:PRINT_LEVELS]
 
-        if (
-            now - self.last_print
-            >= PRINT_INTERVAL
-        ):
+    # for price, quantity in reversed(
+    #     asks
+    # ):
 
-            self.last_print = now
+    #     print(
+    #         f"{price:>18.8f} "
+    #         f"{quantity:>18.8f}"
+    #     )
 
-            return True
+    # print(
+    #     "--------------------------------------------------"
+    # )
 
-        return False
+    # ========================================================
+    # BIDS
+    # ========================================================
+
+    # print("BIDS")
+
+    # bids = sorted(
+    #     orderbook.bids.items(),
+    #     reverse=True,
+    # )[:PRINT_LEVELS]
+
+    # for price, quantity in bids:
+
+    #     print(
+    #         f"{price:>18.8f} "
+    #         f"{quantity:>18.8f}"
+    #     )
+
+    # print(
+    #     "=================================================="
+    # )
+
+
+# ============================================================
+# PRINT TIMER
+# ============================================================
+
+def should_print(
+    orderbook: OKXLocalOrderBook,
+) -> bool:
+
+    now = time.monotonic()
+
+    if (
+        now - orderbook.last_print
+        >= PRINT_INTERVAL
+    ):
+
+        orderbook.last_print = now
+
+        return True
+
+    return False
 
 
 # ============================================================
@@ -390,8 +577,6 @@ class OKXOrderBook:
 def parse_message(
     message: str,
 ) -> tuple[str, dict | None]:
-
-    print("parse_message")
 
     try:
 
@@ -403,8 +588,7 @@ def parse_message(
 
         logger.warning(
             "OKX OrderBook: "
-            "некорректный JSON: %s",
-            message,
+            "некорректный JSON"
         )
 
         return (
@@ -508,7 +692,9 @@ async def subscribe(
     }
 
     await ws.send(
-        json.dumps(request)
+        json.dumps(
+            request
+        )
     )
 
     logger.info(
@@ -519,24 +705,28 @@ async def subscribe(
 
 
 # ============================================================
-# MAIN CONNECTION
+# MAIN ORDERBOOK LOOP
 # ============================================================
 
 async def run_okx_orderbook(
     symbol: str,
 ) -> None:
 
+    symbol = symbol.upper()
+
     logger.info(
         "OKX OrderBook %s: запуск",
         symbol,
     )
 
-    reconnect_delay = 5
+    reconnect_delay = RECONNECT_DELAY
 
     while True:
 
-        book = OKXOrderBook(
-            symbol
+        orderbook = (
+            OKXLocalOrderBook(
+                symbol
+            )
         )
 
         try:
@@ -562,7 +752,9 @@ async def run_okx_orderbook(
                     symbol,
                 )
 
-                reconnect_delay = 5
+                reconnect_delay = (
+                    RECONNECT_DELAY
+                )
 
                 await subscribe(
                     ws,
@@ -589,9 +781,8 @@ async def run_okx_orderbook(
 
                         logger.info(
                             "OKX OrderBook %s: "
-                            "подписка подтверждена: %s",
+                            "подписка подтверждена",
                             symbol,
-                            payload,
                         )
 
                         continue
@@ -628,17 +819,27 @@ async def run_okx_orderbook(
                             symbol,
                         )
 
-                        book.load_snapshot(
+                        orderbook.load_snapshot(
                             payload
+                        )
+
+                        publish_orderbook(
+                            orderbook
                         )
 
                         logger.info(
                             "OKX OrderBook %s: "
-                            "локальный стакан готов",
+                            "локальный стакан готов: "
+                            "update_id=%d bids=%d asks=%d",
                             symbol,
+                            orderbook.seq_id,
+                            len(orderbook.bids),
+                            len(orderbook.asks),
                         )
 
-                        book.print_book()
+                        print_orderbook(
+                            orderbook
+                        )
 
                         continue
 
@@ -648,13 +849,21 @@ async def run_okx_orderbook(
 
                     if action == "update":
 
-                        book.apply_update(
+                        orderbook.apply_update(
                             payload
                         )
 
-                        if book.should_print():
+                        publish_orderbook(
+                            orderbook
+                        )
 
-                            book.print_book()
+                        if should_print(
+                            orderbook
+                        ):
+
+                            print_orderbook(
+                                orderbook
+                            )
 
         except asyncio.CancelledError:
 
@@ -698,15 +907,49 @@ async def run_okx_orderbook(
 
         reconnect_delay = min(
             reconnect_delay * 2,
-            60,
+            MAX_RECONNECT_DELAY,
         )
 
 
 # ============================================================
-# ENTRY POINT
+# SYMBOL CONVERSION
 # ============================================================
 
-async def main():
+def convert_symbol(
+    input_symbol: str,
+) -> str:
+
+    input_symbol = (
+        input_symbol.upper()
+    )
+
+    if input_symbol.endswith(
+        "-USDT-SWAP"
+    ):
+
+        return input_symbol
+
+    if input_symbol.endswith(
+        "USDT"
+    ):
+
+        asset = input_symbol[:-4]
+
+        return (
+            f"{asset}-USDT-SWAP"
+        )
+
+    raise ValueError(
+        f"Неподдерживаемый символ: "
+        f"{input_symbol}"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main() -> None:
 
     if len(sys.argv) < 2:
 
@@ -722,37 +965,11 @@ async def main():
 
         return
 
-    input_symbol = (
-        sys.argv[1]
-        .upper()
+    input_symbol = sys.argv[1]
+
+    symbol = convert_symbol(
+        input_symbol
     )
-
-    # ========================================================
-    # BTCUSDT -> BTC-USDT-SWAP
-    # ========================================================
-
-    if input_symbol.endswith(
-        "USDT"
-    ):
-
-        asset = input_symbol[:-4]
-
-        symbol = (
-            f"{asset}-USDT-SWAP"
-        )
-
-    elif input_symbol.endswith(
-        "-USDT-SWAP"
-    ):
-
-        symbol = input_symbol
-
-    else:
-
-        raise ValueError(
-            f"Неподдерживаемый символ: "
-            f"{input_symbol}"
-        )
 
     await run_okx_orderbook(
         symbol
@@ -764,6 +981,15 @@ async def main():
 # ============================================================
 
 if __name__ == "__main__":
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s - "
+            "%(levelname)s - "
+            "%(message)s"
+        ),
+    )
 
     try:
 

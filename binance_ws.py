@@ -49,6 +49,7 @@ async def run_binance_connection(
 
             async with websockets.connect(
                 url,
+                open_timeout=30,
                 ping_interval=20,
                 ping_timeout=20,
                 close_timeout=5,
@@ -167,6 +168,14 @@ async def run_binance_connection(
                 connection_id,
                 exc.code,
                 exc.reason,
+            )
+
+        except TimeoutError:
+
+            logger.warning(
+                "Binance WS[%d]: "
+                "таймаут при подключении",
+                connection_id,
             )
 
         await asyncio.sleep(

@@ -10,6 +10,8 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from config import BASE_URL_BITGET
+from price_feeds.orderbook_models import OrderBook
+from price_feeds.orderbook_cache import update_orderbook
 
 
 logger = logging.getLogger(__name__)
@@ -21,115 +23,153 @@ logger = logging.getLogger(__name__)
 
 WS_URL = "wss://ws.bitget.com/v2/ws/public"
 
+REST_URL = (
+    f"{BASE_URL_BITGET}"
+    "/api/v2/mix/market/merge-depth"
+)
+
+CHANNEL = "books"
+
+PRODUCT_TYPE = "USDT-FUTURES"
+
 DEPTH_LIMIT = 50
+
 DISPLAY_LEVELS = 10
 
 SNAPSHOT_TIMEOUT = 10
+
 WS_TIMEOUT = 30
 
 RECONNECT_DELAY = 5
 
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+PRINT_INTERVAL = 1.0
 
 
 # ============================================================
-# EXCEPTIONS
+# INTERNAL ORDER BOOK
 # ============================================================
 
-class OrderBookSyncError(Exception):
-    pass
+class BitgetLocalOrderBook:
 
-
-# ============================================================
-# ORDER BOOK
-# ============================================================
-
-class OrderBook:
-
-    def __init__(self, symbol: str):
+    def __init__(
+        self,
+        symbol: str,
+    ):
 
         self.symbol = symbol
 
         self.bids: dict[float, float] = {}
         self.asks: dict[float, float] = {}
 
-        self.last_update_id = 0
+        self.update_id = 0
 
-        self.events_applied = 0
+        self.exchange_timestamp = 0
+
+        self.received_at = 0
+
+        self.received_at_ns = 0
+
+        self.events = 0
 
         self.synced = False
 
-    # --------------------------------------------------------
-    # Snapshot
-    # --------------------------------------------------------
+    # ========================================================
+    # LOAD SNAPSHOT
+    # ========================================================
 
     def load_snapshot(
         self,
-        bids: list[list[str]],
-        asks: list[list[str]],
-        update_id: int,
-    ):
-
-        logger.info(
-            "Bitget OrderBook %s: загрузка snapshot",
-            self.symbol,
-        )
+        bids: list,
+        asks: list,
+        timestamp: int,
+    ) -> None:
 
         self.bids.clear()
         self.asks.clear()
 
-        for level in bids:
+        self._apply_levels(
+            self.bids,
+            bids,
+        )
 
-            if len(level) < 2:
-                continue
+        self._apply_levels(
+            self.asks,
+            asks,
+        )
 
-            price = float(level[0])
-            quantity = float(level[1])
+        self.update_id = timestamp
 
-            if quantity > 0:
-                self.bids[price] = quantity
+        self.exchange_timestamp = timestamp
 
-        for level in asks:
+        self.received_at = int(
+            time.time() * 1000
+        )
 
-            if len(level) < 2:
-                continue
+        self.received_at_ns = time.time_ns()
 
-            price = float(level[0])
-            quantity = float(level[1])
+        self.events = 0
 
-            if quantity > 0:
-                self.asks[price] = quantity
-
-        self.last_update_id = update_id
-
-        self.events_applied = 0
+        self.synced = True
 
         logger.info(
-            "Bitget OrderBook %s: snapshot загружен: "
-            "update_id=%s bids=%d asks=%d",
+            "Bitget OrderBook %s: "
+            "snapshot загружен: "
+            "timestamp=%s bids=%d asks=%d",
             self.symbol,
-            self.last_update_id,
+            timestamp,
             len(self.bids),
             len(self.asks),
         )
 
-    # --------------------------------------------------------
-    # Apply levels
-    # --------------------------------------------------------
+    # ========================================================
+    # APPLY UPDATE
+    # ========================================================
 
-    def _apply_levels(
+    def apply_update(
         self,
-        levels: list[list[str]],
+        bids: list,
+        asks: list,
+        timestamp: int,
+    ) -> None:
+
+        if not self.synced:
+
+            raise RuntimeError(
+                "Нельзя применить update "
+                "до snapshot"
+            )
+
+        self._apply_levels(
+            self.bids,
+            bids,
+        )
+
+        self._apply_levels(
+            self.asks,
+            asks,
+        )
+
+        self.update_id = timestamp
+
+        self.exchange_timestamp = timestamp
+
+        self.received_at = int(
+            time.time() * 1000
+        )
+
+        self.received_at_ns = time.time_ns()
+
+        self.events += 1
+
+    # ========================================================
+    # APPLY LEVELS
+    # ========================================================
+
+    @staticmethod
+    def _apply_levels(
         book: dict[float, float],
-    ):
+        levels: list,
+    ) -> None:
 
         for level in levels:
 
@@ -138,8 +178,13 @@ class OrderBook:
 
             try:
 
-                price = float(level[0])
-                quantity = float(level[1])
+                price = float(
+                    level[0]
+                )
+
+                quantity = float(
+                    level[1]
+                )
 
             except (
                 TypeError,
@@ -149,85 +194,106 @@ class OrderBook:
                 continue
 
             if quantity == 0:
-                book.pop(price, None)
+
+                book.pop(
+                    price,
+                    None,
+                )
 
             else:
+
                 book[price] = quantity
 
-    # --------------------------------------------------------
-    # Apply update
-    # --------------------------------------------------------
-
-    def apply_update(
-        self,
-        bids: list[list[str]],
-        asks: list[list[str]],
-        update_id: int,
-    ):
-
-        self._apply_levels(
-            bids,
-            self.bids,
-        )
-
-        self._apply_levels(
-            asks,
-            self.asks,
-        )
-
-        self.last_update_id = update_id
-
-        self.events_applied += 1
-
-    # --------------------------------------------------------
-    # Best bid
-    # --------------------------------------------------------
+    # ========================================================
+    # BEST BID
+    # ========================================================
 
     @property
-    def best_bid(self):
+    def best_bid(
+        self,
+    ) -> tuple[float, float] | None:
 
         if not self.bids:
             return None
 
-        return max(self.bids)
+        price = max(
+            self.bids
+        )
 
-    # --------------------------------------------------------
-    # Best ask
-    # --------------------------------------------------------
+        return (
+            price,
+            self.bids[price],
+        )
+
+    # ========================================================
+    # BEST ASK
+    # ========================================================
 
     @property
-    def best_ask(self):
+    def best_ask(
+        self,
+    ) -> tuple[float, float] | None:
 
         if not self.asks:
             return None
 
-        return min(self.asks)
+        price = min(
+            self.asks
+        )
 
-    # --------------------------------------------------------
-    # Spread
-    # --------------------------------------------------------
+        return (
+            price,
+            self.asks[price],
+        )
 
-    @property
-    def spread(self):
+    # ========================================================
+    # BUILD COMMON ORDERBOOK
+    # ========================================================
 
-        if (
-            self.best_bid is None
-            or self.best_ask is None
-        ):
-            return None
+    def to_common_orderbook(
+        self,
+    ) -> OrderBook:
 
-        return self.best_ask - self.best_bid
+        bids = sorted(
+            self.bids.items(),
+            reverse=True,
+        )
 
-    # --------------------------------------------------------
-    # Print
-    # --------------------------------------------------------
+        asks = sorted(
+            self.asks.items()
+        )
 
-    def print_book(self):
+        return OrderBook(
+            exchange="bitget",
+            symbol=self.symbol,
+
+            bids=bids,
+            asks=asks,
+
+            timestamp=self.exchange_timestamp,
+
+            received_at=self.received_at,
+
+            received_at_ns=self.received_at_ns,
+
+            update_id=self.update_id,
+        )
+
+    # ========================================================
+    # PRINT
+    # ========================================================
+
+    def print_book(
+        self,
+    ) -> None:
 
         best_bid = self.best_bid
         best_ask = self.best_ask
 
-        if best_bid is None or best_ask is None:
+        if (
+            best_bid is None
+            or best_ask is None
+        ):
 
             print(
                 f"{self.symbol}: стакан пуст"
@@ -235,72 +301,99 @@ class OrderBook:
 
             return
 
-        spread = self.spread
+        # bid_price, _ = best_bid
+        # ask_price, _ = best_ask
 
-        spread_percent = (
-            spread / best_bid * 100
-        )
+        # spread = (
+        #     ask_price - bid_price
+        # )
 
-        print()
-        print("=" * 60)
-        print(
-            f"BITGET FUTURES ORDER BOOK: "
-            f"{self.symbol}"
-        )
+        # spread_percent = (
+        #     spread / bid_price * 100
+        #     if bid_price
+        #     else 0
+        # )
 
-        print(
-            f"Update ID: {self.last_update_id}"
-        )
+        # print()
+        # print("=" * 50)
 
-        print(
-            f"Events:    {self.events_applied}"
-        )
+        # print(
+        #     f"BITGET FUTURES ORDER BOOK: "
+        #     f"{self.symbol}"
+        # )
 
-        print(
-            f"Spread:    "
-            f"{spread:.8f} "
-            f"({spread_percent:.6f}%)"
-        )
+        # print(
+        #     f"Update ID: {self.update_id}"
+        # )
 
-        print("-" * 60)
+        # print(
+        #     f"Events:    {self.events}"
+        # )
 
-        print("ASKS")
+        # print(
+        #     f"Spread:    "
+        #     f"{spread:.8f} "
+        #     f"({spread_percent:.6f}%)"
+        # )
 
-        asks = sorted(
-            self.asks.items()
-        )[:DISPLAY_LEVELS]
+        # print("-" * 50)
 
-        for price, quantity in asks:
+        # print("ASKS")
 
-            print(
-                f"{price:16.8f}"
-                f" {quantity:18.8f}"
-            )
+        # asks = sorted(
+        #     self.asks.items()
+        # )[:DISPLAY_LEVELS]
 
-        print("-" * 60)
+        # for price, quantity in reversed(
+        #     asks
+        # ):
 
-        print("BIDS")
+        #     print(
+        #         f"{price:>18.8f} "
+        #         f"{quantity:>18.8f}"
+        #     )
 
-        bids = sorted(
-            self.bids.items(),
-            reverse=True,
-        )[:DISPLAY_LEVELS]
+        # print("-" * 50)
 
-        for price, quantity in bids:
+        # print("BIDS")
 
-            print(
-                f"{price:16.8f}"
-                f" {quantity:18.8f}"
-            )
+        # bids = sorted(
+        #     self.bids.items(),
+        #     reverse=True,
+        # )[:DISPLAY_LEVELS]
 
-        print("=" * 60)
+        # for price, quantity in bids:
+
+        #     print(
+        #         f"{price:>18.8f} "
+        #         f"{quantity:>18.8f}"
+        #     )
+
+        # print("=" * 50)
+
+
+# ============================================================
+# PUBLISH TO COMMON CACHE
+# ============================================================
+
+def publish_orderbook(
+    orderbook: BitgetLocalOrderBook,
+) -> None:
+
+    common_orderbook = (
+        orderbook.to_common_orderbook()
+    )
+
+    update_orderbook(
+        common_orderbook
+    )
 
 
 # ============================================================
 # REST SNAPSHOT
 # ============================================================
 
-def get_snapshot(
+def get_snapshot_sync(
     symbol: str,
 ) -> dict:
 
@@ -310,20 +403,13 @@ def get_snapshot(
         symbol,
     )
 
-    url = (
-        f"{BASE_URL_BITGET}"
-        "/api/v2/mix/market/merge-depth"
-    )
-
-    params = {
-        "symbol": symbol,
-        "productType": "USDT-FUTURES",
-        "limit": DEPTH_LIMIT,
-    }
-
     response = requests.get(
-        url,
-        params=params,
+        REST_URL,
+        params={
+            "symbol": symbol,
+            "productType": PRODUCT_TYPE,
+            "limit": DEPTH_LIMIT,
+        },
         timeout=SNAPSHOT_TIMEOUT,
     )
 
@@ -334,10 +420,13 @@ def get_snapshot(
     if data.get("code") != "00000":
 
         raise RuntimeError(
-            f"Bitget snapshot error: {data}"
+            f"Bitget snapshot error: "
+            f"{data}"
         )
 
-    snapshot = data.get("data")
+    snapshot = data.get(
+        "data"
+    )
 
     if not snapshot:
 
@@ -345,70 +434,65 @@ def get_snapshot(
             "Bitget snapshot is empty"
         )
 
+    # merge-depth обычно возвращает
+    # один объект.
+    if isinstance(
+        snapshot,
+        list,
+    ):
+
+        snapshot = snapshot[0]
+
     return snapshot
 
 
-# ============================================================
-# PARSE SNAPSHOT
-# ============================================================
-
-def parse_snapshot(
+async def get_snapshot(
     symbol: str,
-) -> OrderBook:
+) -> dict:
 
-    snapshot = get_snapshot(
-        symbol
+    return await asyncio.to_thread(
+        get_snapshot_sync,
+        symbol,
     )
 
-    bids = snapshot.get(
-        "bids",
-        [],
+
+# ============================================================
+# PARSE TIMESTAMP
+# ============================================================
+
+def get_timestamp(
+    payload: dict,
+) -> int | None:
+
+    timestamp = (
+        payload.get("ts")
+        or payload.get("timestamp")
     )
 
-    asks = snapshot.get(
-        "asks",
-        [],
-    )
+    if timestamp is None:
+        return None
 
-    # Bitget uses ts as timestamp.
-    # Some API versions can also provide
-    # version/update information.
-    update_id_raw = (
-        snapshot.get("version")
-        or snapshot.get("u")
-        or snapshot.get("seq")
-        or snapshot.get("ts")
-    )
+    try:
 
-    if update_id_raw is None:
-
-        raise RuntimeError(
-            f"Bitget snapshot does not contain "
-            f"update identifier: {snapshot}"
+        return int(
+            timestamp
         )
 
-    update_id = int(update_id_raw)
+    except (
+        TypeError,
+        ValueError,
+    ):
 
-    orderbook = OrderBook(
-        symbol
-    )
-
-    orderbook.load_snapshot(
-        bids=bids,
-        asks=asks,
-        update_id=update_id,
-    )
-
-    return orderbook
+        return None
 
 
 # ============================================================
-# PARSE WS EVENT
+# PARSE MESSAGE
 # ============================================================
 
-def parse_depth_event(
+def parse_message(
     message: str,
-):
+) -> tuple[str, dict | None]:
 
     try:
 
@@ -420,31 +504,70 @@ def parse_depth_event(
 
         logger.warning(
             "Bitget OrderBook: "
-            "некорректный JSON: %s",
-            message,
+            "некорректный JSON"
         )
 
-        return None
+        return (
+            "invalid",
+            None,
+        )
 
-    if data.get("event") == "subscribe":
+    # --------------------------------------------------------
+    # SUBSCRIBE
+    # --------------------------------------------------------
 
-        logger.info(
-            "Bitget OrderBook: "
-            "подписка подтверждена: %s",
+    event = data.get(
+        "event"
+    )
+
+    if event == "subscribe":
+
+        return (
+            "subscribe",
             data,
         )
 
-        return None
+    # --------------------------------------------------------
+    # ERROR
+    # --------------------------------------------------------
 
-    if data.get("event") == "error":
+    if event == "error":
 
-        raise RuntimeError(
-            f"Bitget WS error: {data}"
+        return (
+            "error",
+            data,
         )
 
-    if data.get("arg", {}).get("channel") != "books":
+    # --------------------------------------------------------
+    # CHANNEL
+    # --------------------------------------------------------
 
-        return None
+    arg = data.get(
+        "arg"
+    )
+
+    if not isinstance(
+        arg,
+        dict,
+    ):
+
+        return (
+            "unknown",
+            None,
+        )
+
+    if arg.get(
+        "channel"
+    ) != CHANNEL:
+
+        return (
+            "unknown",
+            None,
+        )
+
+    # --------------------------------------------------------
+    # DATA
+    # --------------------------------------------------------
 
     data_list = data.get(
         "data"
@@ -452,9 +575,22 @@ def parse_depth_event(
 
     if not data_list:
 
-        return None
+        return (
+            "unknown",
+            None,
+        )
 
     payload = data_list[0]
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+
+        return (
+            "unknown",
+            None,
+        )
 
     bids = payload.get(
         "bids",
@@ -466,27 +602,94 @@ def parse_depth_event(
         [],
     )
 
-    timestamp_raw = payload.get(
-        "ts"
+    timestamp = get_timestamp(
+        payload
     )
 
-    if timestamp_raw is None:
+    if timestamp is None:
 
-        return None
+        logger.warning(
+            "Bitget OrderBook: "
+            "event без timestamp"
+        )
 
-    timestamp = int(
-        timestamp_raw
-    )
+        return (
+            "unknown",
+            None,
+        )
 
-    return {
+    result = {
         "bids": bids,
         "asks": asks,
-        "update_id": timestamp,
+        "timestamp": timestamp,
     }
+
+    # Bitget books:
+    #
+    # action=snapshot
+    # action=update
+    #
+    # поэтому передаём action дальше.
+
+    action = data.get(
+        "action"
+    )
+
+    if action == "snapshot":
+
+        return (
+            "snapshot",
+            result,
+        )
+
+    if action == "update":
+
+        return (
+            "update",
+            result,
+        )
+
+    return (
+        "unknown",
+        result,
+    )
 
 
 # ============================================================
-# WEBSOCKET
+# SUBSCRIBE
+# ============================================================
+
+async def subscribe(
+    ws,
+    symbol: str,
+) -> None:
+
+    request = {
+        "op": "subscribe",
+        "args": [
+            {
+                "instType": PRODUCT_TYPE,
+                "channel": CHANNEL,
+                "instId": symbol,
+            }
+        ],
+    }
+
+    await ws.send(
+        json.dumps(
+            request
+        )
+    )
+
+    logger.info(
+        "Bitget OrderBook %s: "
+        "отправлена подписка books",
+        symbol,
+    )
+
+
+# ============================================================
+# CONNECT
 # ============================================================
 
 async def connect_ws(
@@ -509,30 +712,13 @@ async def connect_ws(
     )
 
     logger.info(
-        "Bitget OrderBook %s: WS подключен",
+        "Bitget OrderBook %s: "
+        "WS подключен",
         symbol,
     )
 
-    subscribe_message = {
-        "op": "subscribe",
-        "args": [
-            {
-                "instType": "USDT-FUTURES",
-                "channel": "books",
-                "instId": symbol,
-            }
-        ],
-    }
-
-    await ws.send(
-        json.dumps(
-            subscribe_message
-        )
-    )
-
-    logger.info(
-        "Bitget OrderBook %s: "
-        "отправлена подписка books",
+    await subscribe(
+        ws,
         symbol,
     )
 
@@ -540,73 +726,22 @@ async def connect_ws(
 
 
 # ============================================================
-# EVENT BUFFER
+# SNAPSHOT + BUFFER SYNC
 # ============================================================
 
-async def collect_events(
-    ws,
-    symbol: str,
-    first_event: dict | None = None,
-):
-
-    events = []
-
-    if first_event is not None:
-
-        events.append(
-            first_event
-        )
-
-    while True:
-
-        try:
-
-            message = await asyncio.wait_for(
-                ws.recv(),
-                timeout=WS_TIMEOUT,
-            )
-
-        except asyncio.TimeoutError:
-
-            logger.warning(
-                "Bitget OrderBook %s: "
-                "WS timeout",
-                symbol,
-            )
-
-            break
-
-        event = parse_depth_event(
-            message
-        )
-
-        if event is None:
-            continue
-
-        events.append(
-            event
-        )
-
-        return events
-
-
-# ============================================================
-# SYNC
-# ============================================================
-
-async def sync_orderbook(
+async def synchronize_orderbook(
     symbol: str,
     ws,
     first_event: dict,
-):
+) -> BitgetLocalOrderBook:
 
     logger.info(
         "Bitget OrderBook %s: "
         "первое WS событие получено: "
-        "update_id=%s. "
+        "timestamp=%s. "
         "Запускаем snapshot.",
         symbol,
-        first_event["update_id"],
+        first_event["timestamp"],
     )
 
     buffer = [
@@ -614,45 +749,47 @@ async def sync_orderbook(
     ]
 
     # --------------------------------------------------------
-    # Пока REST snapshot загружается,
-    # продолжаем получать WS events.
+    # Запускаем REST snapshot параллельно.
     # --------------------------------------------------------
 
     snapshot_task = asyncio.create_task(
-        asyncio.to_thread(
-            get_snapshot,
-            symbol,
+        get_snapshot(
+            symbol
         )
     )
 
-    try:
+    # --------------------------------------------------------
+    # Пока REST работает, продолжаем
+    # получать WS events.
+    # --------------------------------------------------------
 
-        while not snapshot_task.done():
+    while not snapshot_task.done():
 
-            try:
+        try:
 
-                message = await asyncio.wait_for(
-                    ws.recv(),
-                    timeout=1,
-                )
-
-            except asyncio.TimeoutError:
-
-                continue
-
-            event = parse_depth_event(
-                message
+            message = await asyncio.wait_for(
+                ws.recv(),
+                timeout=1,
             )
 
-            if event is not None:
+        except asyncio.TimeoutError:
 
-                buffer.append(
-                    event
-                )
+            continue
 
-    finally:
+        action, payload = parse_message(
+            message
+        )
 
-        snapshot = await snapshot_task
+        if action in (
+            "snapshot",
+            "update",
+        ) and payload is not None:
+
+            buffer.append(
+                payload
+            )
+
+    snapshot = await snapshot_task
 
     bids = snapshot.get(
         "bids",
@@ -664,89 +801,69 @@ async def sync_orderbook(
         [],
     )
 
-    update_id_raw = (
-        snapshot.get("version")
-        or snapshot.get("u")
-        or snapshot.get("seq")
-        or snapshot.get("ts")
+    snapshot_timestamp = get_timestamp(
+        snapshot
     )
 
-    if update_id_raw is None:
+    if snapshot_timestamp is None:
 
-        raise OrderBookSyncError(
-            "Bitget snapshot has no update ID"
+        raise RuntimeError(
+            "Bitget snapshot "
+            "не содержит timestamp"
         )
-
-    snapshot_update_id = int(
-        update_id_raw
-    )
 
     logger.info(
         "Bitget OrderBook %s: "
-        "snapshot получен: update_id=%s "
-        "bids=%d asks=%d",
+        "snapshot получен: "
+        "timestamp=%s bids=%d asks=%d",
         symbol,
-        snapshot_update_id,
+        snapshot_timestamp,
         len(bids),
         len(asks),
     )
 
-    orderbook = OrderBook(
+    orderbook = BitgetLocalOrderBook(
         symbol
     )
 
     orderbook.load_snapshot(
         bids=bids,
         asks=asks,
-        update_id=snapshot_update_id,
-    )
-
-    logger.info(
-        "Bitget OrderBook %s: "
-        "начинаем синхронизацию: "
-        "snapshot=%s buffer=%d",
-        symbol,
-        snapshot_update_id,
-        len(buffer),
+        timestamp=snapshot_timestamp,
     )
 
     # --------------------------------------------------------
-    # Bitget books channel is snapshot/delta based.
-    # Find first event newer than snapshot.
+    # Применяем только WS-события,
+    # которые новее snapshot.
+    #
+    # В отличие от Binance здесь нет
+    # полноценной sequence-связи.
     # --------------------------------------------------------
 
     applicable_events = [
         event
         for event in buffer
-        if event["update_id"] > snapshot_update_id
+        if event["timestamp"]
+        > snapshot_timestamp
     ]
 
-    if not applicable_events:
+    for event in applicable_events:
 
-        logger.info(
-            "Bitget OrderBook %s: "
-            "в buffer пока нет событий после snapshot",
-            symbol,
+        orderbook.apply_update(
+            bids=event["bids"],
+            asks=event["asks"],
+            timestamp=event["timestamp"],
         )
-
-    else:
-
-        for event in applicable_events:
-
-            orderbook.apply_update(
-                bids=event["bids"],
-                asks=event["asks"],
-                update_id=event["update_id"],
-            )
 
     orderbook.synced = True
 
     logger.info(
         "Bitget OrderBook %s: "
-        "SYNC SUCCESS: update_id=%s "
-        "bids=%d asks=%d",
+        "SYNC SUCCESS: timestamp=%s "
+        "events=%d bids=%d asks=%d",
         symbol,
-        orderbook.last_update_id,
+        orderbook.update_id,
+        orderbook.events,
         len(orderbook.bids),
         len(orderbook.asks),
     )
@@ -760,11 +877,13 @@ async def sync_orderbook(
 
 async def run_bitget_orderbook(
     symbol: str,
-):
+) -> None:
 
     symbol = symbol.upper()
 
-    reconnect_delay = RECONNECT_DELAY
+    reconnect_delay = (
+        RECONNECT_DELAY
+    )
 
     while True:
 
@@ -781,9 +900,9 @@ async def run_bitget_orderbook(
                 symbol
             )
 
-            # ------------------------------------------------
-            # First event
-            # ------------------------------------------------
+            # =================================================
+            # WAIT FIRST EVENT
+            # =================================================
 
             first_event = None
 
@@ -794,18 +913,41 @@ async def run_bitget_orderbook(
                     timeout=WS_TIMEOUT,
                 )
 
-                first_event = parse_depth_event(
+                action, payload = parse_message(
                     message
                 )
 
-            # ------------------------------------------------
-            # Sync
-            # ------------------------------------------------
+                if action == "error":
 
-            orderbook = await sync_orderbook(
-                symbol= symbol,
-                ws=ws,
-                first_event=first_event,
+                    raise RuntimeError(
+                        f"Bitget WS error: "
+                        f"{payload}"
+                    )
+
+                if (
+                    action == "snapshot"
+                    and payload is not None
+                ):
+
+                    first_event = payload
+
+                elif (
+                    action == "update"
+                    and payload is not None
+                ):
+
+                    first_event = payload
+
+            # =================================================
+            # SYNCHRONIZATION
+            # =================================================
+
+            orderbook = (
+                await synchronize_orderbook(
+                    symbol=symbol,
+                    ws=ws,
+                    first_event=first_event,
+                )
             )
 
             logger.info(
@@ -814,13 +956,25 @@ async def run_bitget_orderbook(
                 symbol,
             )
 
-            reconnect_delay = RECONNECT_DELAY
+            # -------------------------------------------------
+            # Первый publish
+            # -------------------------------------------------
 
-            # ------------------------------------------------
-            # Live updates
-            # ------------------------------------------------
+            publish_orderbook(
+                orderbook
+            )
+
+            orderbook.print_book()
+
+            reconnect_delay = (
+                RECONNECT_DELAY
+            )
 
             last_print = time.monotonic()
+
+            # =================================================
+            # LIVE LOOP
+            # =================================================
 
             while True:
 
@@ -829,51 +983,101 @@ async def run_bitget_orderbook(
                     timeout=WS_TIMEOUT,
                 )
 
-                event = parse_depth_event(
+                action, payload = parse_message(
                     message
                 )
 
-                if event is None:
-                    continue
-
-                update_id = event[
-                    "update_id"
-                ]
-
                 # ------------------------------------------------
-                # Ignore old events
+                # Subscribe confirmation
                 # ------------------------------------------------
 
-                if update_id <= orderbook.last_update_id:
+                if action == "subscribe":
 
-                    logger.debug(
+                    logger.info(
                         "Bitget OrderBook %s: "
-                        "старое событие: "
-                        "update_id=%s local=%s",
+                        "подписка подтверждена",
                         symbol,
-                        update_id,
-                        orderbook.last_update_id,
                     )
 
                     continue
 
                 # ------------------------------------------------
-                # Apply update
+                # Error
                 # ------------------------------------------------
 
+                if action == "error":
+
+                    raise RuntimeError(
+                        f"Bitget WS error: "
+                        f"{payload}"
+                    )
+
+                # ------------------------------------------------
+                # Ignore irrelevant messages
+                # ------------------------------------------------
+
+                if (
+                    action != "update"
+                    or payload is None
+                ):
+
+                    continue
+
+                timestamp = payload[
+                    "timestamp"
+                ]
+
+                # ------------------------------------------------
+                # Bitget does not provide the same
+                # sequence semantics as Binance.
+                #
+                # Поэтому здесь не делаем
+                # sequence-gap validation.
+                #
+                # Старое событие всё равно
+                # не применяем.
+                # ------------------------------------------------
+
+                if (
+                    timestamp
+                    < orderbook.update_id
+                ):
+
+                    logger.debug(
+                        "Bitget OrderBook %s: "
+                        "старое событие: "
+                        "timestamp=%s local=%s",
+                        symbol,
+                        timestamp,
+                        orderbook.update_id,
+                    )
+
+                    continue
+
                 orderbook.apply_update(
-                    bids=event["bids"],
-                    asks=event["asks"],
-                    update_id=update_id,
+                    bids=payload["bids"],
+                    asks=payload["asks"],
+                    timestamp=timestamp,
                 )
 
                 # ------------------------------------------------
-                # Print every ~1 second
+                # Publish to common cache
+                # ------------------------------------------------
+
+                publish_orderbook(
+                    orderbook
+                )
+
+                # ------------------------------------------------
+                # Console output
                 # ------------------------------------------------
 
                 now = time.monotonic()
 
-                if now - last_print >= 1:
+                if (
+                    now - last_print
+                    >= PRINT_INTERVAL
+                ):
 
                     orderbook.print_book()
 
@@ -882,7 +1086,8 @@ async def run_bitget_orderbook(
         except asyncio.CancelledError:
 
             logger.info(
-                "Bitget OrderBook %s: остановлено",
+                "Bitget OrderBook %s: "
+                "остановлено",
                 symbol,
             )
 
@@ -915,8 +1120,11 @@ async def run_bitget_orderbook(
             if ws is not None:
 
                 try:
+
                     await ws.close()
+
                 except Exception:
+
                     pass
 
         logger.info(
@@ -937,10 +1145,10 @@ async def run_bitget_orderbook(
 
 
 # ============================================================
-# CLI
+# MAIN
 # ============================================================
 
-async def main():
+async def main() -> None:
 
     if len(sys.argv) < 2:
 
@@ -956,12 +1164,45 @@ async def main():
 
         return
 
-    symbol = sys.argv[1].upper()
+    symbol = (
+        sys.argv[1]
+        .upper()
+    )
+
+    # ========================================================
+    # Нормализуем символ.
+    #
+    # BTCUSDT -> BTCUSDT
+    #
+    # BTC-USDT-SWAP -> BTCUSDT
+    # ========================================================
+
+    if symbol.endswith(
+        "-USDT-SWAP"
+    ):
+
+        symbol = symbol.replace(
+            "-USDT-SWAP",
+            "USDT",
+        )
+
+    elif not symbol.endswith(
+        "USDT"
+    ):
+
+        raise ValueError(
+            f"Неподдерживаемый символ: "
+            f"{symbol}"
+        )
 
     await run_bitget_orderbook(
         symbol
     )
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
 

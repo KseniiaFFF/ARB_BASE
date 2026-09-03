@@ -1,7 +1,7 @@
 import math
 
 from config import DEPOSIT, RISK_PERC
-from arbitration.profitability.models_prof import Contract
+from models import Contract
 
 
 def get_position_notional() -> float:

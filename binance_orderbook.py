@@ -8,7 +8,10 @@ from dataclasses import dataclass, field
 
 import requests
 import websockets
-from websockets.exceptions import ConnectionClosed
+
+
+from price_feeds.orderbook_models import OrderBook
+from price_feeds.orderbook_cache import update_orderbook
 
 
 logger = logging.getLogger(__name__)
@@ -24,24 +27,20 @@ REST_URL = "https://fapi.binance.com/fapi/v1/depth"
 DEPTH_LIMIT = 1000
 
 SNAPSHOT_TIMEOUT = 5
-WS_TIMEOUT = 10
-
 RECONNECT_DELAY = 2
 
-# Сколько уровней реально храним локально.
-# Для расчёта slippage позже этого обычно будет достаточно.
 MAX_LOCAL_LEVELS = 1000
 
-# Как часто печатаем стакан при standalone-запуске.
 PRINT_INTERVAL = 1.0
 
 
 # ============================================================
-# DATA MODELS
+# BINANCE INTERNAL EVENT MODEL
 # ============================================================
 
 @dataclass(slots=True)
 class DepthEvent:
+
     event_time: int
     transaction_time: int
 
@@ -53,8 +52,13 @@ class DepthEvent:
     asks: list[tuple[float, float]]
 
 
+# ============================================================
+# BINANCE INTERNAL ORDER BOOK
+# ============================================================
+
 @dataclass
-class OrderBook:
+class BinanceOrderBook:
+
     symbol: str
 
     bids: dict[float, float] = field(
@@ -75,9 +79,11 @@ class OrderBook:
 
     last_received_at: int = 0
 
+    last_received_at_ns: int = 0
+
 
 # ============================================================
-# PARSE EVENT
+# PARSE DEPTH EVENT
 # ============================================================
 
 def parse_depth_event(
@@ -86,47 +92,24 @@ def parse_depth_event(
 
     data = json.loads(message)
 
-    event = data.get("e")
-
-    if event != "depthUpdate":
-        return None
-
-    symbol = data.get("s")
-
-    if not symbol:
+    if data.get("e") != "depthUpdate":
         return None
 
     try:
 
-        event_time = int(
-            data["E"]
-        )
+        event_time = int(data["E"])
+        transaction_time = int(data["T"])
 
-        transaction_time = int(
-            data["T"]
-        )
-
-        first_update_id = int(
-            data["U"]
-        )
-
-        final_update_id = int(
-            data["u"]
-        )
-
-        previous_final_update_id = int(
-            data["pu"]
-        )
+        first_update_id = int(data["U"])
+        final_update_id = int(data["u"])
+        previous_final_update_id = int(data["pu"])
 
         bids = [
             (
                 float(price),
                 float(quantity),
             )
-            for price, quantity in data.get(
-                "b",
-                []
-            )
+            for price, quantity in data.get("b", [])
         ]
 
         asks = [
@@ -134,10 +117,7 @@ def parse_depth_event(
                 float(price),
                 float(quantity),
             )
-            for price, quantity in data.get(
-                "a",
-                []
-            )
+            for price, quantity in data.get("a", [])
         ]
 
     except (
@@ -147,16 +127,20 @@ def parse_depth_event(
     ):
 
         logger.exception(
-            "Ошибка разбора Binance depth event"
+            "Binance OrderBook: "
+            "ошибка разбора depth event"
         )
 
         return None
 
     return DepthEvent(
+
         event_time=event_time,
+
         transaction_time=transaction_time,
 
         first_update_id=first_update_id,
+
         final_update_id=final_update_id,
 
         previous_final_update_id=(
@@ -164,6 +148,7 @@ def parse_depth_event(
         ),
 
         bids=bids,
+
         asks=asks,
     )
 
@@ -196,7 +181,7 @@ def apply_levels(
 # ============================================================
 
 def apply_update(
-    orderbook: OrderBook,
+    orderbook: BinanceOrderBook,
     event: DepthEvent,
 ) -> None:
 
@@ -222,6 +207,10 @@ def apply_update(
         int(time.time() * 1000)
     )
 
+    orderbook.last_received_at_ns = (
+        time.time_ns()
+    )
+
     orderbook.event_count += 1
 
 
@@ -230,13 +219,13 @@ def apply_update(
 # ============================================================
 
 def trim_orderbook(
-    orderbook: OrderBook,
+    orderbook: BinanceOrderBook,
 ) -> None:
 
     if len(orderbook.bids) > MAX_LOCAL_LEVELS:
 
         best_bids = sorted(
-            orderbook.bids.keys(),
+            orderbook.bids,
             reverse=True,
         )[:MAX_LOCAL_LEVELS]
 
@@ -248,7 +237,7 @@ def trim_orderbook(
     if len(orderbook.asks) > MAX_LOCAL_LEVELS:
 
         best_asks = sorted(
-            orderbook.asks.keys()
+            orderbook.asks
         )[:MAX_LOCAL_LEVELS]
 
         orderbook.asks = {
@@ -262,32 +251,34 @@ def trim_orderbook(
 # ============================================================
 
 def apply_live_event(
-    orderbook: OrderBook,
+    orderbook: BinanceOrderBook,
     event: DepthEvent,
 ) -> None:
 
     if not orderbook.synced:
+
         raise RuntimeError(
             "Cannot apply live event: "
             "order book is not synchronized"
         )
 
-    previous_id = (
+    local_id = (
         orderbook.last_update_id
     )
 
-    # Binance Futures требует:
+    # Binance Futures:
     #
-    # pu == previous final update ID
+    # pu должен совпадать с предыдущим u.
     #
+
     if (
         event.previous_final_update_id
-        != previous_id
+        != local_id
     ):
 
         raise RuntimeError(
             "Binance order book sequence gap: "
-            f"local={previous_id}, "
+            f"local={local_id}, "
             f"pu={event.previous_final_update_id}, "
             f"U={event.first_update_id}, "
             f"u={event.final_update_id}"
@@ -313,10 +304,12 @@ def get_snapshot_sync(
 
     response = requests.get(
         REST_URL,
+
         params={
             "symbol": symbol,
             "limit": DEPTH_LIMIT,
         },
+
         timeout=SNAPSHOT_TIMEOUT,
     )
 
@@ -327,8 +320,8 @@ def get_snapshot_sync(
     if "lastUpdateId" not in data:
 
         raise RuntimeError(
-            f"Binance snapshot has no "
-            f"lastUpdateId: {data}"
+            "Binance snapshot "
+            "не содержит lastUpdateId"
         )
 
     return data
@@ -353,6 +346,7 @@ async def get_snapshot(
         "Binance OrderBook %s: "
         "snapshot получен: "
         "lastUpdateId=%s, bids=%d, asks=%d",
+
         symbol,
 
         snapshot["lastUpdateId"],
@@ -380,7 +374,7 @@ async def get_snapshot(
 # ============================================================
 
 def apply_snapshot(
-    orderbook: OrderBook,
+    orderbook: BinanceOrderBook,
     snapshot: dict,
 ) -> None:
 
@@ -396,6 +390,7 @@ def apply_snapshot(
         quantity = float(quantity)
 
         if quantity > 0:
+
             orderbook.bids[price] = quantity
 
     for price, quantity in snapshot.get(
@@ -407,6 +402,7 @@ def apply_snapshot(
         quantity = float(quantity)
 
         if quantity > 0:
+
             orderbook.asks[price] = quantity
 
     orderbook.last_update_id = int(
@@ -416,6 +412,12 @@ def apply_snapshot(
     orderbook.synced = False
 
     orderbook.event_count = 0
+
+    orderbook.last_event_time = 0
+
+    orderbook.last_received_at = 0
+
+    orderbook.last_received_at_ns = 0
 
     trim_orderbook(
         orderbook
@@ -427,7 +429,7 @@ def apply_snapshot(
 # ============================================================
 
 def synchronize_from_buffer(
-    orderbook: OrderBook,
+    orderbook: BinanceOrderBook,
     snapshot: dict,
     event_buffer: deque[DepthEvent],
 ) -> None:
@@ -440,8 +442,11 @@ def synchronize_from_buffer(
         "Binance OrderBook %s: "
         "начинаем синхронизацию: "
         "snapshot=%d, buffer=%d",
+
         orderbook.symbol,
+
         snapshot_id,
+
         len(event_buffer),
     )
 
@@ -451,19 +456,16 @@ def synchronize_from_buffer(
     )
 
     # --------------------------------------------------------
-    # Удаляем события, полностью старше snapshot.
+    # Удаляем события полностью старше snapshot.
     #
-    # u <= lastUpdateId
+    # u <= snapshot_id
     # --------------------------------------------------------
 
     while event_buffer:
 
         event = event_buffer[0]
 
-        if (
-            event.final_update_id
-            <= snapshot_id
-        ):
+        if event.final_update_id <= snapshot_id:
 
             event_buffer.popleft()
 
@@ -474,16 +476,13 @@ def synchronize_from_buffer(
     if not event_buffer:
 
         raise RuntimeError(
-            "Buffer пуст после snapshot. "
-            "Ждём новые события."
+            "Buffer пуст после snapshot"
         )
 
     # --------------------------------------------------------
-    # Ищем первое событие, которое пересекает
-    # snapshot + 1:
+    # Ищем событие:
     #
     # U <= snapshot_id + 1 <= u
-    #
     # --------------------------------------------------------
 
     first_event_index = None
@@ -507,14 +506,22 @@ def synchronize_from_buffer(
         first = event_buffer[0]
 
         raise RuntimeError(
-            "Не найдено событие для "
-            "стыковки snapshot с buffer: "
+            "Не найдено событие "
+            "для стыковки snapshot: "
+
             f"snapshot={snapshot_id}, "
-            f"first_buffer_U={first.first_update_id}, "
-            f"first_buffer_u={first.final_update_id}"
+
+            f"first_buffer_U="
+            f"{first.first_update_id}, "
+
+            f"first_buffer_u="
+            f"{first.final_update_id}"
         )
 
+    # --------------------------------------------------------
     # Удаляем события до первого подходящего.
+    # --------------------------------------------------------
+
     for _ in range(
         first_event_index
     ):
@@ -527,19 +534,23 @@ def synchronize_from_buffer(
         "Binance OrderBook %s: "
         "найдено первое событие для sync: "
         "U=%d u=%d pu=%d",
+
         orderbook.symbol,
 
         first_event.first_update_id,
+
         first_event.final_update_id,
+
         first_event.previous_final_update_id,
     )
 
     # --------------------------------------------------------
-    # Первое событие после snapshot.
+    # Первое событие.
     #
-    # Для первого события проверяем диапазон.
-    # pu здесь не обязан совпадать с snapshot ID,
-    # поскольку snapshot может быть снят между update events.
+    # Для него главное условие:
+    #
+    # U <= snapshot_id + 1 <= u
+    #
     # --------------------------------------------------------
 
     if not (
@@ -549,8 +560,8 @@ def synchronize_from_buffer(
     ):
 
         raise RuntimeError(
-            "Первое событие не покрывает "
-            "snapshot + 1"
+            "Первое событие "
+            "не покрывает snapshot + 1"
         )
 
     apply_update(
@@ -559,9 +570,9 @@ def synchronize_from_buffer(
     )
 
     # --------------------------------------------------------
-    # Все последующие события обязаны иметь:
+    # Последующие события.
     #
-    # pu == previous u
+    # pu должен совпадать с предыдущим u.
     # --------------------------------------------------------
 
     for event in event_buffer:
@@ -573,10 +584,18 @@ def synchronize_from_buffer(
 
             raise RuntimeError(
                 "Gap во время snapshot sync: "
-                f"local={orderbook.last_update_id}, "
-                f"pu={event.previous_final_update_id}, "
-                f"U={event.first_update_id}, "
-                f"u={event.final_update_id}"
+
+                f"local="
+                f"{orderbook.last_update_id}, "
+
+                f"pu="
+                f"{event.previous_final_update_id}, "
+
+                f"U="
+                f"{event.first_update_id}, "
+
+                f"u="
+                f"{event.final_update_id}"
             )
 
         apply_update(
@@ -594,13 +613,17 @@ def synchronize_from_buffer(
 
     logger.info(
         "Binance OrderBook %s: "
-        "SYNC SUCCESS: lastUpdateId=%d "
-        "bids=%d asks=%d",
+        "SYNC SUCCESS: "
+        "lastUpdateId=%d "
+        "bids=%d "
+        "asks=%d",
+
         orderbook.symbol,
 
         orderbook.last_update_id,
 
         len(orderbook.bids),
+
         len(orderbook.asks),
     )
 
@@ -610,7 +633,7 @@ def synchronize_from_buffer(
 # ============================================================
 
 def get_best_bid(
-    orderbook: OrderBook,
+    orderbook: BinanceOrderBook,
 ) -> tuple[float, float] | None:
 
     if not orderbook.bids:
@@ -627,7 +650,7 @@ def get_best_bid(
 
 
 def get_best_ask(
-    orderbook: OrderBook,
+    orderbook: BinanceOrderBook,
 ) -> tuple[float, float] | None:
 
     if not orderbook.asks:
@@ -644,15 +667,78 @@ def get_best_ask(
 
 
 # ============================================================
+# BUILD COMMON ORDERBOOK
+# ============================================================
+
+def build_common_orderbook(
+    orderbook: BinanceOrderBook,
+) -> OrderBook:
+
+    bids = sorted(
+        orderbook.bids.items(),
+        key=lambda x: x[0],
+        reverse=True,
+    )[:MAX_LOCAL_LEVELS]
+
+    asks = sorted(
+        orderbook.asks.items(),
+        key=lambda x: x[0],
+    )[:MAX_LOCAL_LEVELS]
+
+    return OrderBook(
+
+        exchange="binance",
+
+        symbol=orderbook.symbol,
+
+        bids=bids,
+
+        asks=asks,
+
+        timestamp=orderbook.last_event_time,
+
+        received_at=orderbook.last_received_at,
+
+        received_at_ns=(
+            orderbook.last_received_at_ns
+        ),
+
+        # ВАЖНО:
+        # это поле есть в общей модели OrderBook.
+        update_id=orderbook.last_update_id,
+    )
+
+
+# ============================================================
+# PUBLISH TO COMMON CACHE
+# ============================================================
+
+def publish_orderbook(
+    orderbook: BinanceOrderBook,
+) -> None:
+
+    common_orderbook = (
+        build_common_orderbook(
+            orderbook
+        )
+    )
+
+    update_orderbook(
+        common_orderbook
+    )
+
+
+# ============================================================
 # PRINT ORDERBOOK
 # ============================================================
 
 def print_orderbook(
-    orderbook: OrderBook,
+    orderbook: BinanceOrderBook,
     levels: int = 10,
 ) -> None:
 
     if not orderbook.synced:
+
         print(
             f"{orderbook.symbol}: "
             "NOT SYNCED"
@@ -677,86 +763,84 @@ def print_orderbook(
 
         return
 
-    bid_price, bid_qty = best_bid
-    ask_price, ask_qty = best_ask
+    # bid_price, _ = best_bid
+    # ask_price, _ = best_ask
 
-    spread = (
-        ask_price - bid_price
-    )
+    # spread = (
+    #     ask_price - bid_price
+    # )
 
-    spread_percent = (
-        spread / bid_price * 100
-    )
+    # spread_percent = (
+    #     spread / bid_price * 100
+    # )
 
-    print()
-    print(
-        "=================================================="
-    )
+    # print()
 
-    print(
-        f"BINANCE FUTURES ORDER BOOK: "
-        f"{orderbook.symbol}"
-    )
+    # print(
+    #     "=================================================="
+    # )
 
-    print(
-        f"Update ID: {orderbook.last_update_id}"
-    )
+    # print(
+    #     "BINANCE FUTURES ORDER BOOK: "
+    #     f"{orderbook.symbol}"
+    # )
 
-    print(
-        f"Events:    {orderbook.event_count}"
-    )
+    # print(
+    #     f"Update ID: "
+    #     f"{orderbook.last_update_id}"
+    # )
 
-    print(
-        f"Spread:    "
-        f"{spread:.8f} "
-        f"({spread_percent:.6f}%)"
-    )
+    # print(
+    #     f"Events:    "
+    #     f"{orderbook.event_count}"
+    # )
 
-    print(
-        "--------------------------------------------------"
-    )
+    # print(
+    #     f"Spread:    "
+    #     f"{spread:.8f} "
+    #     f"({spread_percent:.6f}%)"
+    # )
 
-    print(
-        "ASKS"
-    )
+    # print(
+    #     "--------------------------------------------------"
+    # )
 
-    asks = sorted(
-        orderbook.asks.items()
-    )[:levels]
+    # print("ASKS")
 
-    for price, quantity in reversed(
-        asks
-    ):
+    # asks = sorted(
+    #     orderbook.asks.items()
+    # )[:levels]
 
-        print(
-            f"{price:>18.8f} "
-            f"{quantity:>18.8f}"
-        )
+    # for price, quantity in reversed(
+    #     asks
+    # ):
 
-    print(
-        "------------------"
-        "------------------------------"
-    )
+    #     print(
+    #         f"{price:>18.8f} "
+    #         f"{quantity:>18.8f}"
+    #     )
 
-    print(
-        "BIDS"
-    )
+    # print(
+    #     "--------------------------------------------------"
+    # )
 
-    bids = sorted(
-        orderbook.bids.items(),
-        reverse=True,
-    )[:levels]
+    # print("BIDS")
 
-    for price, quantity in bids:
+    # bids = sorted(
+    #     orderbook.bids.items(),
+    #     reverse=True,
+    # )[:levels]
 
-        print(
-            f"{price:>18.8f} "
-            f"{quantity:>18.8f}"
-        )
+    # for price, quantity in bids:
 
-    print(
-        "=================================================="
-    )
+    #     print(
+    #         f"{price:>18.8f} "
+    #         f"{quantity:>18.8f}"
+    #     )
+
+    # print(
+    #     "=================================================="
+    # )
 
 
 # ============================================================
@@ -769,10 +853,6 @@ async def run_binance_orderbook(
 
     symbol = symbol.upper()
 
-    orderbook = OrderBook(
-        symbol=symbol
-    )
-
     logger.info(
         "Binance OrderBook %s: запуск",
         symbol,
@@ -780,15 +860,15 @@ async def run_binance_orderbook(
 
     while True:
 
+        orderbook = BinanceOrderBook(
+            symbol=symbol
+        )
+
         event_buffer: deque[
             DepthEvent
         ] = deque()
 
         try:
-
-            # =================================================
-            # CONNECT WS
-            # =================================================
 
             ws_url = (
                 f"{WS_URL}/"
@@ -798,15 +878,21 @@ async def run_binance_orderbook(
             logger.info(
                 "Binance OrderBook %s: "
                 "подключение WS: %s",
+
                 symbol,
+
                 ws_url,
             )
 
             async with websockets.connect(
                 ws_url,
+
                 ping_interval=20,
+
                 ping_timeout=20,
+
                 close_timeout=5,
+
                 max_size=None,
             ) as ws:
 
@@ -815,10 +901,6 @@ async def run_binance_orderbook(
                     "WS подключен",
                     symbol,
                 )
-
-                # =================================================
-                # BUFFER EVENTS
-                # =================================================
 
                 snapshot_task = None
 
@@ -847,32 +929,15 @@ async def run_binance_orderbook(
                     if event is None:
                         continue
 
-                    # ---------------------------------------------
-                    # До snapshot складываем события в buffer.
-                    # ---------------------------------------------
+                    # =================================================
+                    # BUFFER
+                    # =================================================
 
                     if not synced:
 
                         event_buffer.append(
                             event
                         )
-
-                        logger.debug(
-                            "Binance OrderBook %s: "
-                            "buffer event U=%d u=%d pu=%d "
-                            "buffer=%d",
-                            symbol,
-
-                            event.first_update_id,
-                            event.final_update_id,
-                            event.previous_final_update_id,
-
-                            len(event_buffer),
-                        )
-
-                        # -----------------------------------------
-                        # Snapshot запускаем только один раз.
-                        # -----------------------------------------
 
                         if snapshot_task is None:
 
@@ -881,10 +946,13 @@ async def run_binance_orderbook(
                                 "первое WS событие получено: "
                                 "U=%d u=%d pu=%d. "
                                 "Запускаем snapshot.",
+
                                 symbol,
 
                                 event.first_update_id,
+
                                 event.final_update_id,
+
                                 event.previous_final_update_id,
                             )
 
@@ -896,13 +964,8 @@ async def run_binance_orderbook(
                                 )
                             )
 
-                        # -----------------------------------------
-                        # Проверяем готовность snapshot.
-                        # -----------------------------------------
-
                         if (
-                            snapshot_task is not None
-                            and snapshot_task.done()
+                            snapshot_task.done()
                         ):
 
                             snapshot = (
@@ -911,7 +974,9 @@ async def run_binance_orderbook(
 
                             synchronize_from_buffer(
                                 orderbook,
+
                                 snapshot,
+
                                 event_buffer,
                             )
 
@@ -923,36 +988,42 @@ async def run_binance_orderbook(
                                 symbol,
                             )
 
+                            # Публикуем сразу.
+                            publish_orderbook(
+                                orderbook
+                            )
+
                             print_orderbook(
                                 orderbook,
                                 levels=10,
                             )
 
+                            last_print_time = (
+                                time.monotonic()
+                            )
+
                             continue
 
                     # =================================================
-                    # LIVE EVENTS AFTER SYNC
+                    # LIVE
                     # =================================================
 
                     else:
 
-                        try:
+                        apply_live_event(
+                            orderbook,
+                            event,
+                        )
 
-                            apply_live_event(
-                                orderbook,
-                                event,
-                            )
+                        # ---------------------------------------------
+                        # Публикуем каждый полученный event.
+                        #
+                        # Именно это нужно основному scanner.
+                        # ---------------------------------------------
 
-                        except RuntimeError as exc:
-
-                            logger.warning(
-                                "Binance OrderBook %s: "
-                                "LIVE SEQUENCE ERROR: %s",
-                                symbol,
-                                exc,
-                            )
-
-                            raise
+                        publish_orderbook(
+                            orderbook
+                        )
 
                         now = time.monotonic()
 
@@ -982,7 +1053,8 @@ async def run_binance_orderbook(
 
             logger.exception(
                 "Binance OrderBook %s: "
-                "ошибка, выполняется полный resync",
+                "ошибка, выполняется "
+                "полный resync",
                 symbol,
             )
 
@@ -1023,10 +1095,16 @@ async def main() -> None:
     )
 
 
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
 if __name__ == "__main__":
 
     logging.basicConfig(
+
         level=logging.INFO,
+
         format=(
             "%(asctime)s - "
             "%(levelname)s - "

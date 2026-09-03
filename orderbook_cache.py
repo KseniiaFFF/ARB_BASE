@@ -3,20 +3,24 @@ import time
 from price_feeds.orderbook_models import OrderBook
 
 
-orderbook_cache: dict[str, dict[str, OrderBook]] = {}
+orderbook_cache: dict[
+    str,
+    dict[str, OrderBook]
+] = {}
 
 
 def update_orderbook(
     orderbook: OrderBook,
 ) -> None:
 
-    exchange = orderbook.exchange
-    symbol = orderbook.symbol
+    exchange_cache = orderbook_cache.setdefault(
+        orderbook.exchange,
+        {}
+    )
 
-    if exchange not in orderbook_cache:
-        orderbook_cache[exchange] = {}
-
-    orderbook_cache[exchange][symbol] = orderbook
+    exchange_cache[
+        orderbook.symbol
+    ] = orderbook
 
 
 def get_orderbook(
@@ -65,6 +69,25 @@ def is_orderbook_fresh(
     return age <= max_age_ms
 
 
+def get_orderbook_count() -> int:
+
+    return sum(
+        len(exchange_cache)
+        for exchange_cache
+        in orderbook_cache.values()
+    )
+
+
+def get_exchange_orderbooks(
+    exchange: str,
+) -> dict[str, OrderBook]:
+
+    return orderbook_cache.get(
+        exchange,
+        {}
+    )
+
+
 def remove_orderbook(
     exchange: str,
     symbol: str,
@@ -82,6 +105,13 @@ def remove_orderbook(
         None
     )
 
+    if not exchange_cache:
+        orderbook_cache.pop(
+            exchange,
+            None
+        )
+
 
 def clear_orderbook_cache() -> None:
+
     orderbook_cache.clear()
