@@ -14,19 +14,7 @@ fee_updated_at: float = 0.0
 
 
 def refresh_fees(symbols_by_exchange: dict[str, str]) -> None:
-    """
-    Получает текущую taker-комиссию один раз для каждой биржи.
-
-    symbols_by_exchange:
-        {
-            "binance": "BTCUSDT",
-            "bitget": "BTCUSDT",
-            "okx": "BTC-USDT-SWAP",
-        }
-
-    После успешного обновления значения хранятся в fee_cache.
-    """
-
+    
     global fee_updated_at
 
     new_fees: dict[str, float] = {}
@@ -58,8 +46,6 @@ def refresh_fees(symbols_by_exchange: dict[str, str]) -> None:
             )
             raise
 
-    # Обновляем cache только если ВСЕ три комиссии успешно получены.
-    # Это важно: нельзя оставить часть старых и часть новых значений.
     fee_cache.clear()
     fee_cache.update(new_fees)
 
@@ -71,11 +57,6 @@ def refresh_fees(symbols_by_exchange: dict[str, str]) -> None:
 
 
 def get_fee(exchange: str) -> float:
-    """
-    Возвращает уже загруженную taker-комиссию.
-
-    HTTP-запросов здесь нет.
-    """
 
     try:
         return fee_cache[exchange]

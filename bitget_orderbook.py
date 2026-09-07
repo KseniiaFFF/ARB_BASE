@@ -3,51 +3,30 @@ import json
 import logging
 import sys
 import time
-
-import requests
 import websockets
 
 from websockets.exceptions import ConnectionClosed
-
-from config import BASE_URL_BITGET
 from price_feeds.orderbook_models import OrderBook
 from price_feeds.orderbook_cache import update_orderbook
 
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
 WS_URL = "wss://ws.bitget.com/v2/ws/public"
 
-REST_URL = (
-    f"{BASE_URL_BITGET}"
-    "/api/v2/mix/market/merge-depth"
-)
-
 CHANNEL = "books"
-
 PRODUCT_TYPE = "USDT-FUTURES"
-
-DEPTH_LIMIT = 50
 
 DISPLAY_LEVELS = 10
 
-SNAPSHOT_TIMEOUT = 10
-
-WS_TIMEOUT = 30
+WS_TIMEOUT = 15
 
 RECONNECT_DELAY = 5
+MAX_RECONNECT_DELAY = 60
 
 PRINT_INTERVAL = 1.0
 
 
-# ============================================================
-# INTERNAL ORDER BOOK
-# ============================================================
 
 class BitgetLocalOrderBook:
 
@@ -55,34 +34,38 @@ class BitgetLocalOrderBook:
         self,
         symbol: str,
     ):
-
         self.symbol = symbol
 
         self.bids: dict[float, float] = {}
         self.asks: dict[float, float] = {}
+
+        self.seq = 0
 
         self.update_id = 0
 
         self.exchange_timestamp = 0
 
         self.received_at = 0
-
         self.received_at_ns = 0
 
         self.events = 0
 
         self.synced = False
 
-    # ========================================================
-    # LOAD SNAPSHOT
-    # ========================================================
 
     def load_snapshot(
         self,
         bids: list,
         asks: list,
         timestamp: int,
+        seq: int,
     ) -> None:
+
+        if seq <= 0:
+            raise RuntimeError(
+                f"Bitget OrderBook {self.symbol}: "
+                f"invalid snapshot seq={seq}"
+            )
 
         self.bids.clear()
         self.asks.clear()
@@ -97,7 +80,8 @@ class BitgetLocalOrderBook:
             asks,
         )
 
-        self.update_id = timestamp
+        self.seq = seq
+        self.update_id = seq
 
         self.exchange_timestamp = timestamp
 
@@ -113,31 +97,83 @@ class BitgetLocalOrderBook:
 
         logger.info(
             "Bitget OrderBook %s: "
-            "snapshot загружен: "
-            "timestamp=%s bids=%d asks=%d",
+            "WS snapshot загружен: "
+            "seq=%s timestamp=%s "
+            "bids=%d asks=%d",
             self.symbol,
+            seq,
             timestamp,
             len(self.bids),
             len(self.asks),
         )
 
-    # ========================================================
-    # APPLY UPDATE
-    # ========================================================
 
     def apply_update(
         self,
         bids: list,
         asks: list,
         timestamp: int,
+        seq: int,
+        pseq: int,
     ) -> None:
 
         if not self.synced:
-
             raise RuntimeError(
                 "Нельзя применить update "
                 "до snapshot"
             )
+
+        if seq <= 0:
+            raise RuntimeError(
+                f"Bitget OrderBook {self.symbol}: "
+                f"invalid update seq={seq}"
+            )
+
+        if pseq <= 0:
+            raise RuntimeError(
+                f"Bitget OrderBook {self.symbol}: "
+                f"invalid update pseq={pseq}"
+            )
+
+
+        if self.events == 0:
+
+            if not (
+                pseq
+                <= self.seq
+                <= seq
+            ):
+
+                raise RuntimeError(
+                    f"Bitget OrderBook {self.symbol}: "
+                    f"SEQUENCE GAP: "
+                    f"snapshot_seq={self.seq} "
+                    f"pseq={pseq} "
+                    f"seq={seq}"
+                )
+
+        else:
+
+            if pseq != self.seq:
+
+                raise RuntimeError(
+                    f"Bitget OrderBook {self.symbol}: "
+                    f"SEQUENCE GAP: "
+                    f"current_seq={self.seq} "
+                    f"received_pseq={pseq} "
+                    f"received_seq={seq}"
+                )
+
+
+        if seq < self.seq:
+
+            raise RuntimeError(
+                f"Bitget OrderBook {self.symbol}: "
+                f"OUT-OF-ORDER: "
+                f"current_seq={self.seq} "
+                f"received_seq={seq}"
+            )
+
 
         self._apply_levels(
             self.bids,
@@ -149,7 +185,8 @@ class BitgetLocalOrderBook:
             asks,
         )
 
-        self.update_id = timestamp
+        self.seq = seq
+        self.update_id = seq
 
         self.exchange_timestamp = timestamp
 
@@ -161,9 +198,6 @@ class BitgetLocalOrderBook:
 
         self.events += 1
 
-    # ========================================================
-    # APPLY LEVELS
-    # ========================================================
 
     @staticmethod
     def _apply_levels(
@@ -173,24 +207,26 @@ class BitgetLocalOrderBook:
 
         for level in levels:
 
+            if not isinstance(level, (list, tuple)):
+                continue
+
             if len(level) < 2:
                 continue
 
             try:
-
-                price = float(
-                    level[0]
-                )
-
-                quantity = float(
-                    level[1]
-                )
+                price = float(level[0])
+                quantity = float(level[1])
 
             except (
                 TypeError,
                 ValueError,
             ):
+                continue
 
+            if price <= 0:
+                continue
+
+            if quantity < 0:
                 continue
 
             if quantity == 0:
@@ -204,9 +240,6 @@ class BitgetLocalOrderBook:
 
                 book[price] = quantity
 
-    # ========================================================
-    # BEST BID
-    # ========================================================
 
     @property
     def best_bid(
@@ -225,9 +258,6 @@ class BitgetLocalOrderBook:
             self.bids[price],
         )
 
-    # ========================================================
-    # BEST ASK
-    # ========================================================
 
     @property
     def best_ask(
@@ -246,9 +276,6 @@ class BitgetLocalOrderBook:
             self.asks[price],
         )
 
-    # ========================================================
-    # BUILD COMMON ORDERBOOK
-    # ========================================================
 
     def to_common_orderbook(
         self,
@@ -273,108 +300,11 @@ class BitgetLocalOrderBook:
             timestamp=self.exchange_timestamp,
 
             received_at=self.received_at,
-
             received_at_ns=self.received_at_ns,
 
             update_id=self.update_id,
         )
 
-    # ========================================================
-    # PRINT
-    # ========================================================
-
-    def print_book(
-        self,
-    ) -> None:
-
-        best_bid = self.best_bid
-        best_ask = self.best_ask
-
-        if (
-            best_bid is None
-            or best_ask is None
-        ):
-
-            print(
-                f"{self.symbol}: стакан пуст"
-            )
-
-            return
-
-        # bid_price, _ = best_bid
-        # ask_price, _ = best_ask
-
-        # spread = (
-        #     ask_price - bid_price
-        # )
-
-        # spread_percent = (
-        #     spread / bid_price * 100
-        #     if bid_price
-        #     else 0
-        # )
-
-        # print()
-        # print("=" * 50)
-
-        # print(
-        #     f"BITGET FUTURES ORDER BOOK: "
-        #     f"{self.symbol}"
-        # )
-
-        # print(
-        #     f"Update ID: {self.update_id}"
-        # )
-
-        # print(
-        #     f"Events:    {self.events}"
-        # )
-
-        # print(
-        #     f"Spread:    "
-        #     f"{spread:.8f} "
-        #     f"({spread_percent:.6f}%)"
-        # )
-
-        # print("-" * 50)
-
-        # print("ASKS")
-
-        # asks = sorted(
-        #     self.asks.items()
-        # )[:DISPLAY_LEVELS]
-
-        # for price, quantity in reversed(
-        #     asks
-        # ):
-
-        #     print(
-        #         f"{price:>18.8f} "
-        #         f"{quantity:>18.8f}"
-        #     )
-
-        # print("-" * 50)
-
-        # print("BIDS")
-
-        # bids = sorted(
-        #     self.bids.items(),
-        #     reverse=True,
-        # )[:DISPLAY_LEVELS]
-
-        # for price, quantity in bids:
-
-        #     print(
-        #         f"{price:>18.8f} "
-        #         f"{quantity:>18.8f}"
-        #     )
-
-        # print("=" * 50)
-
-
-# ============================================================
-# PUBLISH TO COMMON CACHE
-# ============================================================
 
 def publish_orderbook(
     orderbook: BitgetLocalOrderBook,
@@ -389,76 +319,24 @@ def publish_orderbook(
     )
 
 
-# ============================================================
-# REST SNAPSHOT
-# ============================================================
 
-def get_snapshot_sync(
-    symbol: str,
-) -> dict:
+def parse_int(
+    value,
+) -> int | None:
 
-    logger.info(
-        "Bitget OrderBook %s: "
-        "запрос REST snapshot...",
-        symbol,
-    )
+    if value is None:
+        return None
 
-    response = requests.get(
-        REST_URL,
-        params={
-            "symbol": symbol,
-            "productType": PRODUCT_TYPE,
-            "limit": DEPTH_LIMIT,
-        },
-        timeout=SNAPSHOT_TIMEOUT,
-    )
+    try:
+        return int(value)
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    if data.get("code") != "00000":
-
-        raise RuntimeError(
-            f"Bitget snapshot error: "
-            f"{data}"
-        )
-
-    snapshot = data.get(
-        "data"
-    )
-
-    if not snapshot:
-
-        raise RuntimeError(
-            "Bitget snapshot is empty"
-        )
-
-    # merge-depth обычно возвращает
-    # один объект.
-    if isinstance(
-        snapshot,
-        list,
+    except (
+        TypeError,
+        ValueError,
     ):
-
-        snapshot = snapshot[0]
-
-    return snapshot
+        return None
 
 
-async def get_snapshot(
-    symbol: str,
-) -> dict:
-
-    return await asyncio.to_thread(
-        get_snapshot_sync,
-        symbol,
-    )
-
-
-# ============================================================
-# PARSE TIMESTAMP
-# ============================================================
 
 def get_timestamp(
     payload: dict,
@@ -469,30 +347,45 @@ def get_timestamp(
         or payload.get("timestamp")
     )
 
-    if timestamp is None:
-        return None
-
-    try:
-
-        return int(
-            timestamp
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        return None
+    return parse_int(
+        timestamp
+    )
 
 
-# ============================================================
-# PARSE MESSAGE
-# ============================================================
+def get_sequence(
+    payload: dict,
+) -> tuple[int | None, int | None]:
+
+    seq = parse_int(
+        payload.get("seq")
+    )
+
+    pseq = parse_int(
+        payload.get("pseq")
+    )
+
+    return seq, pseq
+
 
 def parse_message(
     message: str,
 ) -> tuple[str, dict | None]:
+
+
+    if message == "ping":
+
+        return (
+            "ping",
+            None,
+        )
+
+    if message == "pong":
+
+        return (
+            "pong",
+            None,
+        )
+
 
     try:
 
@@ -500,11 +393,15 @@ def parse_message(
             message
         )
 
-    except json.JSONDecodeError:
+    except (
+        json.JSONDecodeError,
+        TypeError,
+    ):
 
         logger.warning(
             "Bitget OrderBook: "
-            "некорректный JSON"
+            "некорректный JSON: %r",
+            message,
         )
 
         return (
@@ -512,9 +409,16 @@ def parse_message(
             None,
         )
 
-    # --------------------------------------------------------
-    # SUBSCRIBE
-    # --------------------------------------------------------
+    if not isinstance(
+        data,
+        dict,
+    ):
+
+        return (
+            "unknown",
+            None,
+        )
+
 
     event = data.get(
         "event"
@@ -527,9 +431,6 @@ def parse_message(
             data,
         )
 
-    # --------------------------------------------------------
-    # ERROR
-    # --------------------------------------------------------
 
     if event == "error":
 
@@ -538,9 +439,6 @@ def parse_message(
             data,
         )
 
-    # --------------------------------------------------------
-    # CHANNEL
-    # --------------------------------------------------------
 
     arg = data.get(
         "arg"
@@ -565,13 +463,20 @@ def parse_message(
             None,
         )
 
-    # --------------------------------------------------------
-    # DATA
-    # --------------------------------------------------------
 
     data_list = data.get(
         "data"
     )
+
+    if not isinstance(
+        data_list,
+        list,
+    ):
+
+        return (
+            "unknown",
+            None,
+        )
 
     if not data_list:
 
@@ -592,6 +497,7 @@ def parse_message(
             None,
         )
 
+
     bids = payload.get(
         "bids",
         [],
@@ -601,6 +507,21 @@ def parse_message(
         "asks",
         [],
     )
+
+    if not isinstance(
+        bids,
+        list,
+    ):
+
+        bids = []
+
+    if not isinstance(
+        asks,
+        list,
+    ):
+
+        asks = []
+
 
     timestamp = get_timestamp(
         payload
@@ -618,18 +539,35 @@ def parse_message(
             None,
         )
 
+
+    seq, pseq = get_sequence(
+        payload
+    )
+
+    if seq is None:
+
+        logger.warning(
+            "Bitget OrderBook %s: "
+            "event без seq",
+            arg.get("instId"),
+        )
+
+        return (
+            "unknown",
+            None,
+        )
+
+
     result = {
         "bids": bids,
         "asks": asks,
+
         "timestamp": timestamp,
+
+        "seq": seq,
+        "pseq": pseq,
     }
 
-    # Bitget books:
-    #
-    # action=snapshot
-    # action=update
-    #
-    # поэтому передаём action дальше.
 
     action = data.get(
         "action"
@@ -654,10 +592,6 @@ def parse_message(
         result,
     )
 
-
-# ============================================================
-# SUBSCRIBE
-# ============================================================
 
 async def subscribe(
     ws,
@@ -688,10 +622,6 @@ async def subscribe(
     )
 
 
-# ============================================================
-# CONNECT
-# ============================================================
-
 async def connect_ws(
     symbol: str,
 ):
@@ -705,9 +635,12 @@ async def connect_ws(
 
     ws = await websockets.connect(
         WS_URL,
+
         ping_interval=None,
         ping_timeout=None,
+
         close_timeout=5,
+
         max_size=None,
     )
 
@@ -725,54 +658,23 @@ async def connect_ws(
     return ws
 
 
-# ============================================================
-# SNAPSHOT + BUFFER SYNC
-# ============================================================
-
-async def synchronize_orderbook(
+async def wait_for_snapshot(
     symbol: str,
     ws,
-    first_event: dict,
-) -> BitgetLocalOrderBook:
+) -> dict:
 
-    logger.info(
-        "Bitget OrderBook %s: "
-        "первое WS событие получено: "
-        "timestamp=%s. "
-        "Запускаем snapshot.",
-        symbol,
-        first_event["timestamp"],
-    )
+    while True:
 
-    buffer = [
-        first_event
-    ]
-
-    # --------------------------------------------------------
-    # Запускаем REST snapshot параллельно.
-    # --------------------------------------------------------
-
-    snapshot_task = asyncio.create_task(
-        get_snapshot(
-            symbol
+        message = await asyncio.wait_for(
+            ws.recv(),
+            timeout=WS_TIMEOUT,
         )
-    )
 
-    # --------------------------------------------------------
-    # Пока REST работает, продолжаем
-    # получать WS events.
-    # --------------------------------------------------------
+        if message == "ping":
 
-    while not snapshot_task.done():
-
-        try:
-
-            message = await asyncio.wait_for(
-                ws.recv(),
-                timeout=1,
+            await ws.send(
+                "pong"
             )
-
-        except asyncio.TimeoutError:
 
             continue
 
@@ -780,100 +682,78 @@ async def synchronize_orderbook(
             message
         )
 
-        if action in (
-            "snapshot",
-            "update",
-        ) and payload is not None:
 
-            buffer.append(
-                payload
+        if action == "subscribe":
+
+            logger.info(
+                "Bitget OrderBook %s: "
+                "подписка подтверждена",
+                symbol,
             )
 
-    snapshot = await snapshot_task
+            continue
 
-    bids = snapshot.get(
-        "bids",
-        [],
-    )
 
-    asks = snapshot.get(
-        "asks",
-        [],
-    )
+        if action == "error":
 
-    snapshot_timestamp = get_timestamp(
-        snapshot
-    )
+            raise RuntimeError(
+                f"Bitget WS error: "
+                f"{payload}"
+            )
 
-    if snapshot_timestamp is None:
 
-        raise RuntimeError(
-            "Bitget snapshot "
-            "не содержит timestamp"
-        )
+        if (
+            action == "snapshot"
+            and payload is not None
+        ):
 
-    logger.info(
-        "Bitget OrderBook %s: "
-        "snapshot получен: "
-        "timestamp=%s bids=%d asks=%d",
-        symbol,
-        snapshot_timestamp,
-        len(bids),
-        len(asks),
-    )
+            return payload
+
+
+def create_orderbook_from_snapshot(
+    symbol: str,
+    snapshot: dict,
+) -> BitgetLocalOrderBook:
 
     orderbook = BitgetLocalOrderBook(
         symbol
     )
 
-    orderbook.load_snapshot(
-        bids=bids,
-        asks=asks,
-        timestamp=snapshot_timestamp,
+    seq = snapshot.get(
+        "seq"
     )
 
-    # --------------------------------------------------------
-    # Применяем только WS-события,
-    # которые новее snapshot.
-    #
-    # В отличие от Binance здесь нет
-    # полноценной sequence-связи.
-    # --------------------------------------------------------
+    timestamp = snapshot.get(
+        "timestamp"
+    )
 
-    applicable_events = [
-        event
-        for event in buffer
-        if event["timestamp"]
-        > snapshot_timestamp
-    ]
-
-    for event in applicable_events:
-
-        orderbook.apply_update(
-            bids=event["bids"],
-            asks=event["asks"],
-            timestamp=event["timestamp"],
+    if seq is None:
+        raise RuntimeError(
+            f"Bitget OrderBook {symbol}: "
+            "snapshot без seq"
         )
 
-    orderbook.synced = True
+    if timestamp is None:
+        raise RuntimeError(
+            f"Bitget OrderBook {symbol}: "
+            "snapshot без timestamp"
+        )
 
-    logger.info(
-        "Bitget OrderBook %s: "
-        "SYNC SUCCESS: timestamp=%s "
-        "events=%d bids=%d asks=%d",
-        symbol,
-        orderbook.update_id,
-        orderbook.events,
-        len(orderbook.bids),
-        len(orderbook.asks),
+    orderbook.load_snapshot(
+        bids=snapshot.get(
+            "bids",
+            [],
+        ),
+        asks=snapshot.get(
+            "asks",
+            [],
+        ),
+        timestamp=timestamp,
+        seq=seq,
     )
 
     return orderbook
 
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
 
 async def run_bitget_orderbook(
     symbol: str,
@@ -896,75 +776,39 @@ async def run_bitget_orderbook(
                 symbol,
             )
 
+
             ws = await connect_ws(
                 symbol
             )
 
-            # =================================================
-            # WAIT FIRST EVENT
-            # =================================================
 
-            first_event = None
-
-            while first_event is None:
-
-                message = await asyncio.wait_for(
-                    ws.recv(),
-                    timeout=WS_TIMEOUT,
+            snapshot = (
+                await wait_for_snapshot(
+                    symbol,
+                    ws,
                 )
+            )
 
-                action, payload = parse_message(
-                    message
-                )
-
-                if action == "error":
-
-                    raise RuntimeError(
-                        f"Bitget WS error: "
-                        f"{payload}"
-                    )
-
-                if (
-                    action == "snapshot"
-                    and payload is not None
-                ):
-
-                    first_event = payload
-
-                elif (
-                    action == "update"
-                    and payload is not None
-                ):
-
-                    first_event = payload
-
-            # =================================================
-            # SYNCHRONIZATION
-            # =================================================
 
             orderbook = (
-                await synchronize_orderbook(
-                    symbol=symbol,
-                    ws=ws,
-                    first_event=first_event,
+                create_orderbook_from_snapshot(
+                    symbol,
+                    snapshot,
                 )
             )
 
             logger.info(
                 "Bitget OrderBook %s: "
-                "локальный стакан готов",
+                "локальный стакан готов: "
+                "seq=%s",
                 symbol,
+                orderbook.seq,
             )
-
-            # -------------------------------------------------
-            # Первый publish
-            # -------------------------------------------------
 
             publish_orderbook(
                 orderbook
             )
 
-            orderbook.print_book()
 
             reconnect_delay = (
                 RECONNECT_DELAY
@@ -972,24 +816,47 @@ async def run_bitget_orderbook(
 
             last_print = time.monotonic()
 
-            # =================================================
-            # LIVE LOOP
-            # =================================================
 
             while True:
 
-                message = await asyncio.wait_for(
-                    ws.recv(),
-                    timeout=WS_TIMEOUT,
-                )
+                try:
+
+                    message = await asyncio.wait_for(
+                        ws.recv(),
+                        timeout=WS_TIMEOUT,
+                    )
+
+                except asyncio.TimeoutError:
+
+                    try:
+
+                        await ws.send(
+                            "ping"
+                        )
+
+                    except Exception as exc:
+
+                        raise RuntimeError(
+                            "Bitget heartbeat failed"
+                        ) from exc
+
+                    continue
+
+                if message == "ping":
+
+                    await ws.send(
+                        "pong"
+                    )
+
+                    continue
+
+                if message == "pong":
+
+                    continue
 
                 action, payload = parse_message(
                     message
                 )
-
-                # ------------------------------------------------
-                # Subscribe confirmation
-                # ------------------------------------------------
 
                 if action == "subscribe":
 
@@ -1001,9 +868,6 @@ async def run_bitget_orderbook(
 
                     continue
 
-                # ------------------------------------------------
-                # Error
-                # ------------------------------------------------
 
                 if action == "error":
 
@@ -1012,9 +876,6 @@ async def run_bitget_orderbook(
                         f"{payload}"
                     )
 
-                # ------------------------------------------------
-                # Ignore irrelevant messages
-                # ------------------------------------------------
 
                 if (
                     action != "update"
@@ -1023,54 +884,93 @@ async def run_bitget_orderbook(
 
                     continue
 
-                timestamp = payload[
+
+                timestamp = payload.get(
                     "timestamp"
-                ]
-
-                # ------------------------------------------------
-                # Bitget does not provide the same
-                # sequence semantics as Binance.
-                #
-                # Поэтому здесь не делаем
-                # sequence-gap validation.
-                #
-                # Старое событие всё равно
-                # не применяем.
-                # ------------------------------------------------
-
-                if (
-                    timestamp
-                    < orderbook.update_id
-                ):
-
-                    logger.debug(
-                        "Bitget OrderBook %s: "
-                        "старое событие: "
-                        "timestamp=%s local=%s",
-                        symbol,
-                        timestamp,
-                        orderbook.update_id,
-                    )
-
-                    continue
-
-                orderbook.apply_update(
-                    bids=payload["bids"],
-                    asks=payload["asks"],
-                    timestamp=timestamp,
                 )
 
-                # ------------------------------------------------
-                # Publish to common cache
-                # ------------------------------------------------
+                seq = payload.get(
+                    "seq"
+                )
+
+                pseq = payload.get(
+                    "pseq"
+                )
+
+                if timestamp is None:
+                    raise RuntimeError(
+                        f"Bitget OrderBook {symbol}: "
+                        "update без timestamp"
+                    )
+
+                if seq is None:
+                    raise RuntimeError(
+                        f"Bitget OrderBook {symbol}: "
+                        "update без seq"
+                    )
+
+                if pseq is None:
+                    raise RuntimeError(
+                        f"Bitget OrderBook {symbol}: "
+                        "update без pseq"
+                    )
+
+                if orderbook.events == 0:
+
+                    if not (
+                        pseq
+                        <= orderbook.seq
+                        <= seq
+                    ):
+
+                        raise RuntimeError(
+                            f"Bitget OrderBook {symbol}: "
+                            f"SEQUENCE GAP: "
+                            f"snapshot_seq={orderbook.seq} "
+                            f"pseq={pseq} "
+                            f"seq={seq}"
+                        )
+
+                else:
+
+                    if pseq != orderbook.seq:
+
+                        raise RuntimeError(
+                            f"Bitget OrderBook {symbol}: "
+                            f"SEQUENCE GAP: "
+                            f"local_seq={orderbook.seq} "
+                            f"pseq={pseq} "
+                            f"seq={seq}"
+                        )
+
+
+                if seq < orderbook.seq:
+
+                    raise RuntimeError(
+                        f"Bitget OrderBook {symbol}: "
+                        f"OUT-OF-ORDER: "
+                        f"local_seq={orderbook.seq} "
+                        f"seq={seq}"
+                    )
+
+                orderbook.apply_update(
+                    bids=payload.get(
+                        "bids",
+                        [],
+                    ),
+                    asks=payload.get(
+                        "asks",
+                        [],
+                    ),
+                    timestamp=timestamp,
+                    seq=seq,
+                    pseq=pseq,
+                )
+
 
                 publish_orderbook(
                     orderbook
                 )
-
-                # ------------------------------------------------
-                # Console output
-                # ------------------------------------------------
 
                 now = time.monotonic()
 
@@ -1079,9 +979,9 @@ async def run_bitget_orderbook(
                     >= PRINT_INTERVAL
                 ):
 
-                    orderbook.print_book()
 
                     last_print = now
+
 
         except asyncio.CancelledError:
 
@@ -1093,9 +993,14 @@ async def run_bitget_orderbook(
 
             if ws is not None:
 
-                await ws.close()
+                try:
+                    await ws.close()
+
+                except Exception:
+                    pass
 
             raise
+
 
         except ConnectionClosed as exc:
 
@@ -1111,7 +1016,9 @@ async def run_bitget_orderbook(
 
             logger.exception(
                 "Bitget OrderBook %s: "
-                "ошибка, выполняется resync",
+                "ошибка / sequence gap, "
+                "локальный стакан выбрасывается, "
+                "будет получен новый snapshot",
                 symbol,
             )
 
@@ -1120,11 +1027,9 @@ async def run_bitget_orderbook(
             if ws is not None:
 
                 try:
-
                     await ws.close()
 
                 except Exception:
-
                     pass
 
         logger.info(
@@ -1140,13 +1045,9 @@ async def run_bitget_orderbook(
 
         reconnect_delay = min(
             reconnect_delay * 2,
-            60,
+            MAX_RECONNECT_DELAY,
         )
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 async def main() -> None:
 
@@ -1168,14 +1069,6 @@ async def main() -> None:
         sys.argv[1]
         .upper()
     )
-
-    # ========================================================
-    # Нормализуем символ.
-    #
-    # BTCUSDT -> BTCUSDT
-    #
-    # BTC-USDT-SWAP -> BTCUSDT
-    # ========================================================
 
     if symbol.endswith(
         "-USDT-SWAP"
@@ -1200,10 +1093,6 @@ async def main() -> None:
     )
 
 
-# ============================================================
-# START
-# ============================================================
-
 if __name__ == "__main__":
 
     try:
@@ -1218,3 +1107,4 @@ if __name__ == "__main__":
             "\nBitget OrderBook: "
             "остановлено пользователем"
         )
+

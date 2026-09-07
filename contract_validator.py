@@ -50,21 +50,6 @@ def get_valid_binance_contracts() -> dict[str, Contract]:
                 )
                 continue
 
-            # contract_size = 1.0
-
-            # valid_contracts[symbol] = Contract(
-            #     exchange="binance",
-            #     symbol=symbol,
-            #     asset=symbol[:-4],
-            #     quote="USDT",
-            #     contract_type="perpetual",
-            #     active=True,
-            #     contract_size=contract_size,
-            #     contract_size_currency=contract.get(
-            #         "baseAsset",
-            #         symbol[:-4]
-            #     ),
-            # )
             filters = {
                 item["filterType"]: item
                 for item in contract.get("filters", [])

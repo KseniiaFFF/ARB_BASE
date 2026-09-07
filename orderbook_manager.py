@@ -12,27 +12,18 @@ from price_feeds.orderbook_cache import remove_orderbook
 logger = logging.getLogger(__name__)
 
 
-# Сколько времени держать стакан после того,
-# как связка перестала проходить MIN_PERCENT.
-#
-# Это нужно, чтобы стаканы не запускались/останавливались
-# постоянно при колебании спреда около MIN_PERCENT.
 ORDERBOOK_IDLE_TIMEOUT_MS = 5_000
 
 
 class OrderBookManager:
     def __init__(self):
-        # (exchange, symbol) -> asyncio.Task
+
         self.tasks: dict[tuple[str, str], asyncio.Task] = {}
 
-        # Последнее время, когда этот стакан был нужен
         self.last_needed_ms: dict[tuple[str, str], int] = {}
 
     @staticmethod
     def normalize_symbol(exchange: str, symbol: str) -> str:
-        """
-        Приводит символ к формату, который ожидает конкретная биржа.
-        """
 
         exchange = exchange.lower()
         symbol = symbol.upper()
@@ -48,12 +39,6 @@ class OrderBookManager:
         return symbol
 
     def ensure_orderbook(self, exchange: str, symbol: str):
-        """
-        Запускает стакан, если он ещё не запущен.
-
-        Если стакан уже работает — ничего не делает,
-        только обновляет время его последнего использования.
-        """
 
         exchange = exchange.lower()
         symbol = self.normalize_symbol(exchange, symbol)
@@ -65,11 +50,9 @@ class OrderBookManager:
 
         task = self.tasks.get(key)
 
-        # Уже запущен
         if task is not None and not task.done():
             return
 
-        # Если старый task завершился — удаляем его
         if task is not None and task.done():
             self.tasks.pop(key, None)
 
@@ -107,21 +90,7 @@ class OrderBookManager:
         sell_exchange: str,
         sell_symbol: str,
     ):
-        """
-        Запускает оба стакана, необходимые для арбитражной связки.
-
-        Например:
-
-        Binance BTCUSDT -> OKX BTCUSDT
-
-        запустит:
-
-        Binance BTCUSDT
-        OKX BTC-USDT-SWAP
-
-        Если они уже работают — повторно ничего не запускается.
-        """
-
+        
         self.ensure_orderbook(
             buy_exchange,
             buy_symbol,
@@ -133,15 +102,12 @@ class OrderBookManager:
         )
 
     def cleanup(self):
-        """
-        Останавливает стаканы, которые давно не использовались.
-        """
+        
 
         now_ms = int(time.time() * 1000)
 
         for key, task in list(self.tasks.items()):
 
-            # Уже завершившийся task
             if task.done():
                 self.tasks.pop(key, None)
                 self.last_needed_ms.pop(key, None)
@@ -175,9 +141,6 @@ class OrderBookManager:
             remove_orderbook(exchange, symbol)
 
     async def shutdown(self):
-        """
-        Корректно останавливает все стаканы при завершении программы.
-        """
 
         tasks = list(self.tasks.values())
 
@@ -204,9 +167,6 @@ class OrderBookManager:
         logger.info("All orderbook tasks stopped")
 
     def get_active_count(self) -> int:
-        """
-        Количество работающих стаканов.
-        """
 
         return sum(
             1

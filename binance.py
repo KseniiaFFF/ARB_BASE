@@ -84,21 +84,12 @@ def get_taker_fee(symbol: str) -> float:
         "recvWindow": 5000,
     }
 
-    # query_string = "&".join(
-    #     f"{key}={value}"
-    #     for key, value in params.items()
-    # )
 
     query_string = urlencode(
             params,
             safe=""
         )
 
-    # signature = hmac.new(
-    #     secret_key.encode(),
-    #     query_string.encode(),
-    #     hashlib.sha256,
-    # ).hexdigest()
     signature = hmac.new(
             secret_key.encode("utf-8"),
             query_string.encode("utf-8"),
@@ -138,5 +129,3 @@ def get_taker_fee(symbol: str) -> float:
         )
 
     return float(taker_rate) * 100
-
-    # return float(data["takerCommissionRate"]) * 100

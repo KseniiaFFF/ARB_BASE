@@ -14,6 +14,9 @@ WS_URL = "wss://ws.bitget.com/v2/ws/public"
 
 SUBSCRIPTION_BATCH_SIZE = 50
 
+INITIAL_RECONNECT_DELAY = 5
+MAX_RECONNECT_DELAY = 60
+
 
 def create_subscriptions(
     symbols: list[str],
@@ -43,10 +46,11 @@ async def send_ping(ws) -> None:
 
         raise
 
-    except Exception:
+    except Exception as exc:
 
-        logger.exception(
-            "Bitget WS: ошибка heartbeat"
+        logger.warning(
+            "Bitget WS: heartbeat остановлен: %s",
+            exc,
         )
 
 
@@ -70,25 +74,36 @@ async def run_bitget_ws(
         len(symbols),
     )
 
+    reconnect_delay = INITIAL_RECONNECT_DELAY
+
     while True:
 
         ping_task = None
 
         try:
 
+            logger.info(
+                "Bitget WS: попытка подключения"
+            )
+
             async with websockets.connect(
                 WS_URL,
                 ping_interval=None,
                 max_size=None,
+                open_timeout=30,
+                close_timeout=5,
             ) as ws:
 
                 logger.info(
                     "Bitget WS: соединение установлено"
                 )
 
+                reconnect_delay = INITIAL_RECONNECT_DELAY
+
                 ping_task = asyncio.create_task(
                     send_ping(ws)
                 )
+
 
                 for i in range(
                     0,
@@ -121,13 +136,19 @@ async def run_bitget_ws(
 
                     await asyncio.sleep(0.1)
 
+
                 async for message in ws:
 
                     if message == "pong":
                         continue
 
-                    received_at = int(time.time() * 1000)
-                    received_at_ns = time.monotonic_ns()
+                    received_at = int(
+                        time.time() * 1000
+                    )
+
+                    received_at_ns = (
+                        time.monotonic_ns()
+                    )
 
                     try:
 
@@ -142,6 +163,7 @@ async def run_bitget_ws(
 
                         continue
 
+
                     if data.get("event") == "error":
 
                         logger.error(
@@ -150,6 +172,7 @@ async def run_bitget_ws(
                         )
 
                         continue
+
 
                     if data.get("event") == "subscribe":
 
@@ -165,15 +188,15 @@ async def run_bitget_ws(
                     if not rows:
                         continue
 
+                    symbol = (
+                        data.get("arg", {})
+                        .get("instId")
+                    )
+
+                    if not symbol:
+                        continue
+
                     for book in rows:
-
-                        symbol = (
-                            data.get("arg", {})
-                            .get("instId")
-                        )
-
-                        if not symbol:
-                            continue
 
                         asks = book.get("asks")
                         bids = book.get("bids")
@@ -206,7 +229,6 @@ async def run_bitget_ws(
                                 )
                             )
 
-
                         except (
                             IndexError,
                             KeyError,
@@ -237,8 +259,9 @@ async def run_bitget_ws(
                             ask_qty=ask_qty,
                             timestamp=timestamp,
                             received_at=received_at,
-                            received_at_ns=received_at_ns
+                            received_at_ns=received_at_ns,
                         )
+
 
         except asyncio.CancelledError:
 
@@ -246,33 +269,69 @@ async def run_bitget_ws(
                 "Bitget WS: остановлено"
             )
 
-            if ping_task:
-
-                ping_task.cancel()
-
-                try:
-                    await ping_task
-                except asyncio.CancelledError:
-                    pass
-
             raise
+
+        except websockets.exceptions.ConnectionClosed as exc:
+
+            logger.warning(
+                "Bitget WS: соединение закрыто: "
+                "code=%s reason=%s",
+                exc.code,
+                exc.reason,
+            )
+
+        except TimeoutError:
+
+            logger.warning(
+                "Bitget WS: таймаут подключения"
+            )
+
+
+        except OSError as exc:
+
+            logger.warning(
+                "Bitget WS: сетевая ошибка: %s. "
+                "Переподключение через %d секунд.",
+                exc,
+                reconnect_delay,
+            )
+
 
         except Exception:
 
             logger.exception(
-                "Bitget WS: ошибка соединения. "
-                "Повтор через 5 секунд."
+                "Bitget WS: неожиданная ошибка. "
+                "Переподключение через %d секунд.",
+                reconnect_delay,
             )
+
 
         finally:
 
-            if ping_task:
+            if ping_task is not None:
 
                 ping_task.cancel()
 
                 try:
+
                     await ping_task
+
                 except asyncio.CancelledError:
+
                     pass
 
-        await asyncio.sleep(5)
+
+        logger.info(
+            "Bitget WS: переподключение через %d секунд",
+            reconnect_delay,
+        )
+
+        await asyncio.sleep(
+            reconnect_delay
+        )
+
+
+        reconnect_delay = min(
+            reconnect_delay * 2,
+            MAX_RECONNECT_DELAY,
+        )

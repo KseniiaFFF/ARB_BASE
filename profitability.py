@@ -9,16 +9,9 @@ from profitability.slippage import (
 from profitability.fees import get_fee
 
 
-# ============================================================
-# RESULT
-# ============================================================
-
 @dataclass(slots=True, frozen=True)
 class ArbitrageProfitability:
 
-    # --------------------------------------------------------
-    # Basic
-    # --------------------------------------------------------
 
     buy_exchange: str
     buy_symbol: str
@@ -26,23 +19,14 @@ class ArbitrageProfitability:
     sell_exchange: str
     sell_symbol: str
 
-    # --------------------------------------------------------
-    # Quantities
-    # --------------------------------------------------------
 
     buy_quantity: float
     sell_quantity: float
 
-    # --------------------------------------------------------
-    # Best prices
-    # --------------------------------------------------------
 
     buy_best_price: float
     sell_best_price: float
 
-    # --------------------------------------------------------
-    # Actual execution prices
-    # --------------------------------------------------------
 
     buy_entry_price: float
     sell_entry_price: float
@@ -50,21 +34,8 @@ class ArbitrageProfitability:
     buy_exit_price: float
     sell_exit_price: float
 
-    # --------------------------------------------------------
-    # Top-of-book spread
-    # --------------------------------------------------------
-
     spread_percent: float
-
-    # --------------------------------------------------------
-    # Execution spread
-    # --------------------------------------------------------
-
     execution_spread_percent: float
-
-    # --------------------------------------------------------
-    # Slippage
-    # --------------------------------------------------------
 
     buy_entry_slippage_percent: float
     sell_entry_slippage_percent: float
@@ -74,24 +45,12 @@ class ArbitrageProfitability:
 
     total_slippage_percent: float
 
-    # --------------------------------------------------------
-    # Fees
-    # --------------------------------------------------------
-
     buy_fee_percent: float
     sell_fee_percent: float
 
     total_fee_percent: float
 
-    # --------------------------------------------------------
-    # Final result
-    # --------------------------------------------------------
-
     net_profit_percent: float
-
-    # --------------------------------------------------------
-    # Detailed slippage results
-    # --------------------------------------------------------
 
     buy_entry: SlippageResult
     sell_entry: SlippageResult
@@ -99,51 +58,13 @@ class ArbitrageProfitability:
     buy_exit: SlippageResult
     sell_exit: SlippageResult
 
-
-# ============================================================
-# MAIN CALCULATION
-# ============================================================
-
 def calculate_arbitrage_profitability(
     buy_orderbook: OrderBook,
     sell_orderbook: OrderBook,
     buy_quantity: float,
     sell_quantity: float,
 ) -> ArbitrageProfitability:
-    """
-    Расчёт прибыльности арбитражной сделки.
-
-    BUY exchange:
-        entry -> BUY
-        exit  -> SELL
-
-    SELL exchange:
-        entry -> SELL
-        exit  -> BUY
-
-    Основной результат рассчитывается
-    через реальные средние цены исполнения
-    указанного объёма.
-
-    Комиссии:
-        2 операции на BUY exchange
-        2 операции на SELL exchange
-
-    Slippage:
-        учитывается через фактические
-        средние цены исполнения стакана.
-
-    ВАЖНО:
-        exit slippage рассчитывается по текущему
-        стакану и является оценкой текущей
-        стоимости закрытия, а не гарантированным
-        будущим исполнением.
-    """
-
-    # ========================================================
-    # VALIDATION
-    # ========================================================
-
+    
     if buy_quantity <= 0:
 
         raise ValueError(
@@ -156,9 +77,6 @@ def calculate_arbitrage_profitability(
             "sell_quantity должна быть > 0"
         )
 
-    # Для симметричного арбитража количества
-    # должны совпадать.
-
     if abs(
         buy_quantity - sell_quantity
     ) > 1e-12:
@@ -168,10 +86,6 @@ def calculate_arbitrage_profitability(
             "должны совпадать"
         )
 
-    # ========================================================
-    # BEST PRICES
-    # ========================================================
-
     buy_best_price = _get_best_ask(
         buy_orderbook
     )
@@ -180,25 +94,11 @@ def calculate_arbitrage_profitability(
         sell_orderbook
     )
 
-    # ========================================================
-    # TOP-OF-BOOK SPREAD
-    # ========================================================
-
     spread_percent = (
         sell_best_price
         / buy_best_price
         - 1
     ) * 100
-
-    # ========================================================
-    # ENTRY EXECUTION
-    # ========================================================
-
-    # --------------------------------------------------------
-    # BUY exchange
-    #
-    # Покупаем BTC по ASK.
-    # --------------------------------------------------------
 
     buy_entry = calculate_slippage(
         orderbook=buy_orderbook,
@@ -206,27 +106,11 @@ def calculate_arbitrage_profitability(
         quantity=buy_quantity,
     )
 
-    # --------------------------------------------------------
-    # SELL exchange
-    #
-    # Продаём BTC по BID.
-    # --------------------------------------------------------
-
     sell_entry = calculate_slippage(
         orderbook=sell_orderbook,
         side=Side.SELL,
         quantity=sell_quantity,
     )
-
-    # ========================================================
-    # EXIT EXECUTION
-    # ========================================================
-
-    # --------------------------------------------------------
-    # BUY exchange
-    #
-    # Закрытие BUY -> SELL.
-    # --------------------------------------------------------
 
     buy_exit = calculate_slippage(
         orderbook=buy_orderbook,
@@ -234,21 +118,11 @@ def calculate_arbitrage_profitability(
         quantity=buy_quantity,
     )
 
-    # --------------------------------------------------------
-    # SELL exchange
-    #
-    # Закрытие SELL -> BUY.
-    # --------------------------------------------------------
-
     sell_exit = calculate_slippage(
         orderbook=sell_orderbook,
         side=Side.BUY,
         quantity=sell_quantity,
     )
-
-    # ========================================================
-    # COMPLETE EXECUTION CHECK
-    # ========================================================
 
     if not buy_entry.complete:
 
@@ -294,10 +168,6 @@ def calculate_arbitrage_profitability(
             f"executed={sell_exit.executed_quantity}"
         )
 
-    # ========================================================
-    # ACTUAL EXECUTION PRICES
-    # ========================================================
-
     buy_entry_price = (
         buy_entry.average_price
     )
@@ -314,22 +184,11 @@ def calculate_arbitrage_profitability(
         sell_exit.average_price
     )
 
-    # ========================================================
-    # EXECUTION SPREAD
-    # ========================================================
-
-    # Реальный входной spread для указанного
-    # объёма после прохождения стакана.
-
     execution_spread_percent = (
         sell_entry_price
         / buy_entry_price
         - 1
     ) * 100
-
-    # ========================================================
-    # SLIPPAGE
-    # ========================================================
 
     buy_entry_slippage_percent = (
         buy_entry.slippage_percent
@@ -355,10 +214,6 @@ def calculate_arbitrage_profitability(
         + sell_exit_slippage_percent
     )
 
-    # ========================================================
-    # FEES
-    # ========================================================
-
     buy_fee_percent = get_fee(
         buy_orderbook.exchange,
         buy_orderbook.symbol,
@@ -369,45 +224,10 @@ def calculate_arbitrage_profitability(
         sell_orderbook.symbol,
     )
 
-    # 2 операции на каждой бирже:
-    #
-    # BUY exchange:
-    #     entry + exit
-    #
-    # SELL exchange:
-    #     entry + exit
-
     total_fee_percent = (
         buy_fee_percent * 2
         + sell_fee_percent * 2
     )
-
-    # ========================================================
-    # EXIT EFFECT
-    # ========================================================
-
-    # --------------------------------------------------------
-    # Вход:
-    #
-    # BUY exchange:
-    #     покупка по buy_entry_price
-    #
-    # SELL exchange:
-    #     продажа по sell_entry_price
-    #
-    # Закрытие:
-    #
-    # BUY exchange:
-    #     продажа по buy_exit_price
-    #
-    # SELL exchange:
-    #     покупка по sell_exit_price
-    #
-    # --------------------------------------------------------
-    #
-    # Для каждой ноги рассчитываем её относительный
-    # результат.
-    # --------------------------------------------------------
 
     buy_leg_return = (
         buy_exit_price
@@ -421,27 +241,15 @@ def calculate_arbitrage_profitability(
         - 1
     ) * 100
 
-    # ========================================================
-    # GROSS ARBITRAGE RESULT
-    # ========================================================
-
     gross_profit_percent = (
         buy_leg_return
         + sell_leg_return
     )
 
-    # ========================================================
-    # NET PROFIT
-    # ========================================================
-
     net_profit_percent = (
         gross_profit_percent
         - total_fee_percent
     )
-
-    # ========================================================
-    # RESULT
-    # ========================================================
 
     return ArbitrageProfitability(
 
@@ -542,11 +350,6 @@ def calculate_arbitrage_profitability(
         sell_exit=sell_exit,
     )
 
-
-# ============================================================
-# BEST ASK
-# ============================================================
-
 def _get_best_ask(
     orderbook: OrderBook,
 ) -> float:
@@ -576,11 +379,6 @@ def _get_best_ask(
         )
 
     return min(prices)
-
-
-# ============================================================
-# BEST BID
-# ============================================================
 
 def _get_best_bid(
     orderbook: OrderBook,

@@ -6,10 +6,6 @@ TOP_N = 5
 
 
 def get_top_funding(limit: int = TOP_N):
-    """
-    Возвращает TOP монет Binance USDT-M Futures
-    по абсолютному значению текущего funding rate.
-    """
 
     url = f"{BASE_URL}/fapi/v1/premiumIndex"
 
@@ -24,7 +20,6 @@ def get_top_funding(limit: int = TOP_N):
         symbol = item.get("symbol", "")
         funding_rate = item.get("lastFundingRate")
 
-        # Только USDT perpetual
         if not symbol.endswith("USDT"):
             continue
 
@@ -40,7 +35,6 @@ def get_top_funding(limit: int = TOP_N):
             "abs_funding": abs(funding_rate),
         })
 
-    # Сортируем именно по абсолютному funding
     funding_data.sort(
         key=lambda x: x["abs_funding"],
         reverse=True

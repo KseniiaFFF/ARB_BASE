@@ -14,10 +14,6 @@ from price_feeds.orderbook_cache import update_orderbook
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
 
 CHANNEL = "books"
@@ -28,10 +24,6 @@ PRINT_INTERVAL = 1.0
 RECONNECT_DELAY = 2
 MAX_RECONNECT_DELAY = 60
 
-
-# ============================================================
-# INTERNAL ORDER BOOK
-# ============================================================
 
 class OKXLocalOrderBook:
 
@@ -57,9 +49,6 @@ class OKXLocalOrderBook:
 
         self.last_print = 0.0
 
-    # ========================================================
-    # LOAD SNAPSHOT
-    # ========================================================
 
     def load_snapshot(
         self,
@@ -132,7 +121,6 @@ class OKXLocalOrderBook:
             seq_id
         )
 
-        # OKX snapshot содержит ts.
         timestamp = data.get(
             "ts"
         )
@@ -173,9 +161,6 @@ class OKXLocalOrderBook:
             len(self.asks),
         )
 
-    # ========================================================
-    # APPLY UPDATE
-    # ========================================================
 
     def apply_update(
         self,
@@ -214,9 +199,6 @@ class OKXLocalOrderBook:
             new_seq_id
         )
 
-        # ====================================================
-        # SEQUENCE CHECK
-        # ====================================================
 
         if previous_seq_id != self.seq_id:
 
@@ -234,9 +216,23 @@ class OKXLocalOrderBook:
                 "OKX OrderBook sequence gap"
             )
 
-        # ====================================================
-        # APPLY BIDS
-        # ====================================================
+
+        if new_seq_id < self.seq_id:
+
+            logger.error(
+                "OKX OrderBook %s: "
+                "sequence reset: "
+                "local=%s prevSeqId=%s seqId=%s",
+                self.symbol,
+                self.seq_id,
+                previous_seq_id,
+                new_seq_id,
+            )
+
+            raise RuntimeError(
+                "OKX OrderBook sequence reset"
+            )
+
 
         apply_levels(
             self.bids,
@@ -246,9 +242,6 @@ class OKXLocalOrderBook:
             ),
         )
 
-        # ====================================================
-        # APPLY ASKS
-        # ====================================================
 
         apply_levels(
             self.asks,
@@ -258,9 +251,6 @@ class OKXLocalOrderBook:
             ),
         )
 
-        # ====================================================
-        # UPDATE METADATA
-        # ====================================================
 
         self.seq_id = new_seq_id
 
@@ -293,10 +283,6 @@ class OKXLocalOrderBook:
 
         self.events += 1
 
-
-# ============================================================
-# APPLY LEVELS
-# ============================================================
 
 def apply_levels(
     book: dict[float, float],
@@ -332,10 +318,6 @@ def apply_levels(
             book[price] = quantity
 
 
-# ============================================================
-# BUILD COMMON ORDERBOOK
-# ============================================================
-
 def build_common_orderbook(
     orderbook: OKXLocalOrderBook,
 ) -> OrderBook:
@@ -370,10 +352,6 @@ def build_common_orderbook(
     )
 
 
-# ============================================================
-# PUBLISH TO CACHE
-# ============================================================
-
 def publish_orderbook(
     orderbook: OKXLocalOrderBook,
 ) -> None:
@@ -388,10 +366,6 @@ def publish_orderbook(
         common_orderbook
     )
 
-
-# ============================================================
-# BEST BID / ASK
-# ============================================================
 
 def get_best_bid(
     orderbook: OKXLocalOrderBook,
@@ -427,10 +401,6 @@ def get_best_ask(
     )
 
 
-# ============================================================
-# PRINT ORDERBOOK
-# ============================================================
-
 def print_orderbook(
     orderbook: OKXLocalOrderBook,
 ) -> None:
@@ -461,96 +431,6 @@ def print_orderbook(
 
         return
 
-    # bid_price, bid_quantity = best_bid
-    # ask_price, ask_quantity = best_ask
-
-    # spread = (
-    #     ask_price - bid_price
-    # )
-
-    # spread_percent = (
-    #     spread / bid_price * 100
-    #     if bid_price
-    #     else 0
-    # )
-
-    # print()
-    # print(
-    #     "=================================================="
-    # )
-
-    # print(
-    #     f"OKX FUTURES ORDER BOOK: "
-    #     f"{orderbook.symbol}"
-    # )
-
-    # print(
-    #     f"Update ID: {orderbook.seq_id}"
-    # )
-
-    # print(
-    #     f"Events:    {orderbook.events}"
-    # )
-
-    # print(
-    #     f"Spread:    "
-    #     f"{spread:.8f} "
-    #     f"({spread_percent:.6f}%)"
-    # )
-
-    # print(
-    #     "--------------------------------------------------"
-    # )
-
-    # ========================================================
-    # ASKS
-    # ========================================================
-
-    # print("ASKS")
-
-    # asks = sorted(
-    #     orderbook.asks.items()
-    # )[:PRINT_LEVELS]
-
-    # for price, quantity in reversed(
-    #     asks
-    # ):
-
-    #     print(
-    #         f"{price:>18.8f} "
-    #         f"{quantity:>18.8f}"
-    #     )
-
-    # print(
-    #     "--------------------------------------------------"
-    # )
-
-    # ========================================================
-    # BIDS
-    # ========================================================
-
-    # print("BIDS")
-
-    # bids = sorted(
-    #     orderbook.bids.items(),
-    #     reverse=True,
-    # )[:PRINT_LEVELS]
-
-    # for price, quantity in bids:
-
-    #     print(
-    #         f"{price:>18.8f} "
-    #         f"{quantity:>18.8f}"
-    #     )
-
-    # print(
-    #     "=================================================="
-    # )
-
-
-# ============================================================
-# PRINT TIMER
-# ============================================================
 
 def should_print(
     orderbook: OKXLocalOrderBook,
@@ -569,10 +449,6 @@ def should_print(
 
     return False
 
-
-# ============================================================
-# PARSE MESSAGE
-# ============================================================
 
 def parse_message(
     message: str,
@@ -596,9 +472,6 @@ def parse_message(
             None,
         )
 
-    # ========================================================
-    # WS EVENT
-    # ========================================================
 
     event = data.get(
         "event"
@@ -611,9 +484,6 @@ def parse_message(
             data,
         )
 
-    # ========================================================
-    # CHANNEL
-    # ========================================================
 
     arg = data.get(
         "arg"
@@ -637,9 +507,6 @@ def parse_message(
             data,
         )
 
-    # ========================================================
-    # ACTION
-    # ========================================================
 
     action = data.get(
         "action"
@@ -672,10 +539,6 @@ def parse_message(
     )
 
 
-# ============================================================
-# SUBSCRIBE
-# ============================================================
-
 async def subscribe(
     ws,
     symbol: str,
@@ -703,10 +566,6 @@ async def subscribe(
         symbol,
     )
 
-
-# ============================================================
-# MAIN ORDERBOOK LOOP
-# ============================================================
 
 async def run_okx_orderbook(
     symbol: str,
@@ -761,9 +620,6 @@ async def run_okx_orderbook(
                     symbol,
                 )
 
-                # =================================================
-                # MESSAGE LOOP
-                # =================================================
 
                 async for message in ws:
 
@@ -773,9 +629,6 @@ async def run_okx_orderbook(
                         )
                     )
 
-                    # =============================================
-                    # SUBSCRIBE CONFIRMATION
-                    # =============================================
 
                     if action == "subscribe":
 
@@ -787,9 +640,6 @@ async def run_okx_orderbook(
 
                         continue
 
-                    # =============================================
-                    # ERROR
-                    # =============================================
 
                     if action == "error":
 
@@ -807,9 +657,6 @@ async def run_okx_orderbook(
                     if payload is None:
                         continue
 
-                    # =============================================
-                    # SNAPSHOT
-                    # =============================================
 
                     if action == "snapshot":
 
@@ -843,9 +690,6 @@ async def run_okx_orderbook(
 
                         continue
 
-                    # =============================================
-                    # UPDATE
-                    # =============================================
 
                     if action == "update":
 
@@ -911,10 +755,6 @@ async def run_okx_orderbook(
         )
 
 
-# ============================================================
-# SYMBOL CONVERSION
-# ============================================================
-
 def convert_symbol(
     input_symbol: str,
 ) -> str:
@@ -945,10 +785,6 @@ def convert_symbol(
     )
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 async def main() -> None:
 
     if len(sys.argv) < 2:
@@ -975,10 +811,6 @@ async def main() -> None:
         symbol
     )
 
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
 

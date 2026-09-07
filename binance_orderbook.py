@@ -17,10 +17,6 @@ from price_feeds.orderbook_cache import update_orderbook
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 WS_URL = "wss://fstream.binance.com/ws"
 REST_URL = "https://fapi.binance.com/fapi/v1/depth"
 
@@ -30,13 +26,8 @@ SNAPSHOT_TIMEOUT = 5
 RECONNECT_DELAY = 2
 
 MAX_LOCAL_LEVELS = 1000
-
 PRINT_INTERVAL = 1.0
 
-
-# ============================================================
-# BINANCE INTERNAL EVENT MODEL
-# ============================================================
 
 @dataclass(slots=True)
 class DepthEvent:
@@ -52,9 +43,6 @@ class DepthEvent:
     asks: list[tuple[float, float]]
 
 
-# ============================================================
-# BINANCE INTERNAL ORDER BOOK
-# ============================================================
 
 @dataclass
 class BinanceOrderBook:
@@ -81,10 +69,6 @@ class BinanceOrderBook:
 
     last_received_at_ns: int = 0
 
-
-# ============================================================
-# PARSE DEPTH EVENT
-# ============================================================
 
 def parse_depth_event(
     message: str,
@@ -153,10 +137,6 @@ def parse_depth_event(
     )
 
 
-# ============================================================
-# APPLY LEVELS
-# ============================================================
-
 def apply_levels(
     levels: dict[float, float],
     updates: list[tuple[float, float]],
@@ -175,10 +155,6 @@ def apply_levels(
 
             levels[price] = quantity
 
-
-# ============================================================
-# APPLY UPDATE
-# ============================================================
 
 def apply_update(
     orderbook: BinanceOrderBook,
@@ -214,10 +190,6 @@ def apply_update(
     orderbook.event_count += 1
 
 
-# ============================================================
-# TRIM ORDERBOOK
-# ============================================================
-
 def trim_orderbook(
     orderbook: BinanceOrderBook,
 ) -> None:
@@ -246,10 +218,6 @@ def trim_orderbook(
         }
 
 
-# ============================================================
-# APPLY LIVE EVENT
-# ============================================================
-
 def apply_live_event(
     orderbook: BinanceOrderBook,
     event: DepthEvent,
@@ -265,11 +233,6 @@ def apply_live_event(
     local_id = (
         orderbook.last_update_id
     )
-
-    # Binance Futures:
-    #
-    # pu должен совпадать с предыдущим u.
-    #
 
     if (
         event.previous_final_update_id
@@ -293,10 +256,6 @@ def apply_live_event(
         orderbook
     )
 
-
-# ============================================================
-# REST SNAPSHOT
-# ============================================================
 
 def get_snapshot_sync(
     symbol: str,
@@ -369,10 +328,6 @@ async def get_snapshot(
     return snapshot
 
 
-# ============================================================
-# APPLY SNAPSHOT
-# ============================================================
-
 def apply_snapshot(
     orderbook: BinanceOrderBook,
     snapshot: dict,
@@ -424,10 +379,6 @@ def apply_snapshot(
     )
 
 
-# ============================================================
-# SNAPSHOT + BUFFER SYNCHRONIZATION
-# ============================================================
-
 def synchronize_from_buffer(
     orderbook: BinanceOrderBook,
     snapshot: dict,
@@ -455,11 +406,6 @@ def synchronize_from_buffer(
         snapshot,
     )
 
-    # --------------------------------------------------------
-    # Удаляем события полностью старше snapshot.
-    #
-    # u <= snapshot_id
-    # --------------------------------------------------------
 
     while event_buffer:
 
@@ -479,11 +425,6 @@ def synchronize_from_buffer(
             "Buffer пуст после snapshot"
         )
 
-    # --------------------------------------------------------
-    # Ищем событие:
-    #
-    # U <= snapshot_id + 1 <= u
-    # --------------------------------------------------------
 
     first_event_index = None
 
@@ -518,9 +459,6 @@ def synchronize_from_buffer(
             f"{first.final_update_id}"
         )
 
-    # --------------------------------------------------------
-    # Удаляем события до первого подходящего.
-    # --------------------------------------------------------
 
     for _ in range(
         first_event_index
@@ -544,14 +482,6 @@ def synchronize_from_buffer(
         first_event.previous_final_update_id,
     )
 
-    # --------------------------------------------------------
-    # Первое событие.
-    #
-    # Для него главное условие:
-    #
-    # U <= snapshot_id + 1 <= u
-    #
-    # --------------------------------------------------------
 
     if not (
         first_event.first_update_id
@@ -568,12 +498,6 @@ def synchronize_from_buffer(
         orderbook,
         first_event,
     )
-
-    # --------------------------------------------------------
-    # Последующие события.
-    #
-    # pu должен совпадать с предыдущим u.
-    # --------------------------------------------------------
 
     for event in event_buffer:
 
@@ -628,10 +552,6 @@ def synchronize_from_buffer(
     )
 
 
-# ============================================================
-# BEST BID / ASK
-# ============================================================
-
 def get_best_bid(
     orderbook: BinanceOrderBook,
 ) -> tuple[float, float] | None:
@@ -665,10 +585,6 @@ def get_best_ask(
         orderbook.asks[price],
     )
 
-
-# ============================================================
-# BUILD COMMON ORDERBOOK
-# ============================================================
 
 def build_common_orderbook(
     orderbook: BinanceOrderBook,
@@ -709,10 +625,6 @@ def build_common_orderbook(
     )
 
 
-# ============================================================
-# PUBLISH TO COMMON CACHE
-# ============================================================
-
 def publish_orderbook(
     orderbook: BinanceOrderBook,
 ) -> None:
@@ -727,10 +639,6 @@ def publish_orderbook(
         common_orderbook
     )
 
-
-# ============================================================
-# PRINT ORDERBOOK
-# ============================================================
 
 def print_orderbook(
     orderbook: BinanceOrderBook,
@@ -763,89 +671,6 @@ def print_orderbook(
 
         return
 
-    # bid_price, _ = best_bid
-    # ask_price, _ = best_ask
-
-    # spread = (
-    #     ask_price - bid_price
-    # )
-
-    # spread_percent = (
-    #     spread / bid_price * 100
-    # )
-
-    # print()
-
-    # print(
-    #     "=================================================="
-    # )
-
-    # print(
-    #     "BINANCE FUTURES ORDER BOOK: "
-    #     f"{orderbook.symbol}"
-    # )
-
-    # print(
-    #     f"Update ID: "
-    #     f"{orderbook.last_update_id}"
-    # )
-
-    # print(
-    #     f"Events:    "
-    #     f"{orderbook.event_count}"
-    # )
-
-    # print(
-    #     f"Spread:    "
-    #     f"{spread:.8f} "
-    #     f"({spread_percent:.6f}%)"
-    # )
-
-    # print(
-    #     "--------------------------------------------------"
-    # )
-
-    # print("ASKS")
-
-    # asks = sorted(
-    #     orderbook.asks.items()
-    # )[:levels]
-
-    # for price, quantity in reversed(
-    #     asks
-    # ):
-
-    #     print(
-    #         f"{price:>18.8f} "
-    #         f"{quantity:>18.8f}"
-    #     )
-
-    # print(
-    #     "--------------------------------------------------"
-    # )
-
-    # print("BIDS")
-
-    # bids = sorted(
-    #     orderbook.bids.items(),
-    #     reverse=True,
-    # )[:levels]
-
-    # for price, quantity in bids:
-
-    #     print(
-    #         f"{price:>18.8f} "
-    #         f"{quantity:>18.8f}"
-    #     )
-
-    # print(
-    #     "=================================================="
-    # )
-
-
-# ============================================================
-# MAIN ORDERBOOK LOOP
-# ============================================================
 
 async def run_binance_orderbook(
     symbol: str,
@@ -929,9 +754,6 @@ async def run_binance_orderbook(
                     if event is None:
                         continue
 
-                    # =================================================
-                    # BUFFER
-                    # =================================================
 
                     if not synced:
 
@@ -988,7 +810,6 @@ async def run_binance_orderbook(
                                 symbol,
                             )
 
-                            # Публикуем сразу.
                             publish_orderbook(
                                 orderbook
                             )
@@ -1004,9 +825,6 @@ async def run_binance_orderbook(
 
                             continue
 
-                    # =================================================
-                    # LIVE
-                    # =================================================
 
                     else:
 
@@ -1015,11 +833,6 @@ async def run_binance_orderbook(
                             event,
                         )
 
-                        # ---------------------------------------------
-                        # Публикуем каждый полученный event.
-                        #
-                        # Именно это нужно основному scanner.
-                        # ---------------------------------------------
 
                         publish_orderbook(
                             orderbook
@@ -1069,10 +882,6 @@ async def run_binance_orderbook(
         )
 
 
-# ============================================================
-# STANDALONE
-# ============================================================
-
 async def main() -> None:
 
     if len(sys.argv) < 2:
@@ -1094,10 +903,6 @@ async def main() -> None:
         symbol
     )
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
 

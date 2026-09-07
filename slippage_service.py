@@ -13,12 +13,6 @@ from profitability.slippage import (
     calculate_slippage,
 )
 
-
-# ============================================================
-# EXCEPTIONS
-# ============================================================
-
-
 class SlippageServiceError(Exception):
     """Base exception for slippage service."""
 
@@ -35,11 +29,6 @@ class StaleOrderBookError(
     """Order book exists but is too old."""
 
 
-# ============================================================
-# RESULT
-# ============================================================
-
-
 @dataclass(slots=True)
 class SlippageCheckResult:
 
@@ -49,10 +38,6 @@ class SlippageCheckResult:
 
     max_age_ms: int
 
-
-# ============================================================
-# GET ORDER BOOK
-# ============================================================
 
 
 def get_fresh_orderbook(
@@ -105,11 +90,6 @@ def get_fresh_orderbook(
     return orderbook
 
 
-# ============================================================
-# CALCULATE FROM CACHE
-# ============================================================
-
-
 def calculate_cached_slippage(
     exchange: str,
     symbol: str,
@@ -148,11 +128,6 @@ def calculate_cached_slippage(
     )
 
 
-# ============================================================
-# BUY
-# ============================================================
-
-
 def calculate_cached_buy_slippage(
     exchange: str,
     symbol: str,
@@ -167,12 +142,6 @@ def calculate_cached_buy_slippage(
         quantity=quantity,
         max_age_ms=max_age_ms,
     )
-
-
-# ============================================================
-# SELL
-# ============================================================
-
 
 def calculate_cached_sell_slippage(
     exchange: str,

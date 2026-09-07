@@ -178,6 +178,17 @@ async def run_binance_connection(
                 connection_id,
             )
 
+        except OSError as exc:
+
+            logger.warning(
+                "Binance WS[%d]: "
+                "сетевая ошибка: %s. "
+                "Переподключение через %d сек.",
+                connection_id,
+                exc,
+                reconnect_delay,
+            )
+
         await asyncio.sleep(
             reconnect_delay
         )
