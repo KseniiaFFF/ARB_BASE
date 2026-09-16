@@ -31,6 +31,11 @@ class SignalState:
     last_seen_at_ms: int
     last_seen_at_ns: int
 
+    # В event-driven режиме opportunity может отсутствовать
+    # несколько миллисекунд между двумя обновлениями рынка.
+    # Не закрываем сигнал мгновенно: сначала ставим его на grace period.
+    missing_since_ns: int | None
+
     samples: int
 
     start_net_profit_percent: float
@@ -123,9 +128,13 @@ class SignalTracker:
     def __init__(
         self,
         stats_file: str = DEFAULT_STATS_FILE,
+        disappearance_grace_ms: float = 15.0,
     ) -> None:
 
         self.stats_file = stats_file
+        self.disappearance_grace_ns = int(
+            max(0.0, disappearance_grace_ms) * 1_000_000
+        )
 
         self.active: dict[
             tuple[str, str, str],
@@ -415,6 +424,8 @@ class SignalTracker:
             last_seen_at_ms=now_ms,
             last_seen_at_ns=now_ns,
 
+            missing_since_ns=None,
+
             samples=1,
 
             start_net_profit_percent=net_profit,
@@ -513,18 +524,18 @@ class SignalTracker:
             state.key
         ] = state
 
-        logger.info(
-            "SIGNAL START | "
-            "#%d | "
-            "%s | "
-            "%s -> %s | "
-            "NET=%.4f%%",
-            signal_id,
-            state.asset,
-            state.buy_exchange,
-            state.sell_exchange,
-            net_profit,
-        )
+        # logger.info(
+        #     "SIGNAL START | "
+        #     "#%d | "
+        #     "%s | "
+        #     "%s -> %s | "
+        #     "NET=%.4f%%",
+        #     signal_id,
+        #     state.asset,
+        #     state.buy_exchange,
+        #     state.sell_exchange,
+        #     net_profit,
+        # )
 
         return state
 
@@ -570,6 +581,7 @@ class SignalTracker:
 
         state.last_seen_at_ms = now_ms
         state.last_seen_at_ns = now_ns
+        state.missing_since_ns = None
 
         state.samples += 1
 
@@ -726,6 +738,13 @@ class SignalTracker:
                     "Ошибка обработки signal tracker"
                 )
 
+        # В event-driven режиме update() может содержать только
+        # часть рынка (например, dirty assets). Поэтому отсутствие
+        # opportunity в одном проходе НЕ означает мгновенное исчезновение.
+        #
+        # Сначала ставим сигнал на grace period. Если opportunity
+        # возвращается в течение окна — продолжаем тот же lifecycle.
+        # Если нет — только тогда закрываем его как DISAPPEARED.
         active_keys = set(
             self.active.keys()
         )
@@ -736,6 +755,21 @@ class SignalTracker:
         )
 
         for key in disappeared_keys:
+
+            state = self.active.get(key)
+
+            if state is None:
+                continue
+
+            if state.missing_since_ns is None:
+                state.missing_since_ns = now_ns
+                continue
+
+            if (
+                now_ns - state.missing_since_ns
+                < self.disappearance_grace_ns
+            ):
+                continue
 
             self._close_signal(
                 key=key,
@@ -782,26 +816,26 @@ class SignalTracker:
             close_reason=close_reason,
         )
 
-        logger.info(
-            "SIGNAL END | "
-            "#%d | "
-            "%s | "
-            "%s -> %s | "
-            "lifetime=%.3f ms | "
-            "samples=%d | "
-            "max_net=%.4f%% | "
-            "end_net=%.4f%% | "
-            "reason=%s",
-            signal_id,
-            state.asset,
-            state.buy_exchange,
-            state.sell_exchange,
-            lifetime_ms,
-            state.samples,
-            state.max_net_profit_percent,
-            state.last_net_profit_percent,
-            close_reason,
-        )
+        # logger.info(
+        #     "SIGNAL END | "
+        #     "#%d | "
+        #     "%s | "
+        #     "%s -> %s | "
+        #     "lifetime=%.3f ms | "
+        #     "samples=%d | "
+        #     "max_net=%.4f%% | "
+        #     "end_net=%.4f%% | "
+        #     "reason=%s",
+        #     signal_id,
+        #     state.asset,
+        #     state.buy_exchange,
+        #     state.sell_exchange,
+        #     lifetime_ms,
+        #     state.samples,
+        #     state.max_net_profit_percent,
+        #     state.last_net_profit_percent,
+        #     close_reason,
+        # )
 
         self._signal_ids.pop(
             id(state),

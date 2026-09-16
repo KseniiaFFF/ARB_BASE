@@ -1,26 +1,45 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
+import random
 import time
-import websockets
 
-from price_feeds.models_price import Price
+import websockets
 from websockets.exceptions import ConnectionClosed
 
+from price_feeds.models_price import Price
+import market_latency
+import market_events
 
 logger = logging.getLogger(__name__)
-
 
 WS_URL = "wss://fstream.binance.com/stream"
 STREAM_BATCH_SIZE = 10
 
 
 def create_subscriptions(symbols: list[str]) -> list[str]:
+    return [f"{symbol.lower()}@bookTicker" for symbol in symbols]
 
-    return [
-        f"{symbol.lower()}@bookTicker"
-        for symbol in symbols
-    ]
+
+def _parse_book_ticker(message: str) -> tuple[str, float, float, float, float, int] | None:
+    data = json.loads(message)
+    payload = data.get("data")
+    if not payload or payload.get("e") != "bookTicker":
+        return None
+
+    try:
+        return (
+            str(payload["s"]),
+            float(payload["b"]),
+            float(payload["a"]),
+            float(payload["B"]),
+            float(payload["A"]),
+            int(payload["E"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 async def run_binance_connection(
@@ -28,117 +47,43 @@ async def run_binance_connection(
     price_cache: dict[str, dict[str, Price]],
     connection_id: int,
 ) -> None:
-
     if not streams:
         return
 
-    params = "/".join(streams)
-    url = f"{WS_URL}?streams={params}"
-
-    logger.info(
-        "Binance WS[%d]: подключение, streams=%d",
-        connection_id,
-        len(streams),
-    )
-
-    reconnect_delay = 5
+    url = f"{WS_URL}?streams={'/'.join(streams)}"
+    reconnect_delay = 1.0
 
     while True:
-
         try:
-
             async with websockets.connect(
                 url,
-                open_timeout=30,
+                open_timeout=15,
                 ping_interval=20,
                 ping_timeout=20,
                 close_timeout=5,
                 max_size=None,
             ) as ws:
-
-                logger.info(
-                    "Binance WS[%d]: соединение установлено",
-                    connection_id,
-                )
-
-                reconnect_delay = 5
+                reconnect_delay = 1.0
 
                 async for message in ws:
-
-                    received_at = int(
-                        time.time() * 1000
-                    )
-
-                    received_at_ns = (
-                        time.monotonic_ns()
-                    )
+                    received_at = int(time.time() * 1000)
+                    received_at_ns = time.monotonic_ns()
 
                     try:
-                        data = json.loads(message)
-
+                        parsed = _parse_book_ticker(message)
                     except json.JSONDecodeError:
-
-                        logger.warning(
-                            "Binance WS[%d]: "
-                            "некорректный JSON",
-                            connection_id,
-                        )
-
                         continue
 
-                    payload = data.get("data")
-
-                    if not payload:
+                    if parsed is None:
                         continue
 
-                    symbol = payload.get("s")
-
-                    if not symbol:
+                    symbol, bid, ask, bid_qty, ask_qty, timestamp = parsed
+                    if bid <= 0 or ask <= 0:
                         continue
 
-                    try:
+                    asset = symbol[:-4] if symbol.endswith("USDT") else symbol
 
-                        bid = float(
-                            payload["b"]
-                        )
-
-                        ask = float(
-                            payload["a"]
-                        )
-
-                        bid_qty = float(
-                            payload["B"]
-                        )
-
-                        ask_qty = float(
-                            payload["A"]
-                        )
-
-                        timestamp = int(
-                            payload["E"]
-                        )
-
-                    except (
-                        KeyError,
-                        TypeError,
-                        ValueError,
-                    ):
-
-                        logger.exception(
-                            "Binance WS[%d]: "
-                            "ошибка обработки: %s",
-                            connection_id,
-                            payload,
-                        )
-
-                        continue
-
-                    asset = symbol[:-4]
-
-                    price_cache.setdefault(
-                        asset,
-                        {},
-                    )["binance"] = Price(
+                    price_cache.setdefault(asset, {})["binance"] = Price(
                         asset=asset,
                         exchange="binance",
                         symbol=symbol,
@@ -151,113 +96,44 @@ async def run_binance_connection(
                         received_at_ns=received_at_ns,
                     )
 
+                    market_latency.mark_ws_update(asset, "binance")
+                    market_events.mark_asset_dirty(asset)
+
         except asyncio.CancelledError:
-
-            logger.info(
-                "Binance WS[%d]: остановлено",
-                connection_id,
-            )
-
             raise
+        except (ConnectionClosed, TimeoutError, OSError):
+            pass
+        except Exception:
+            logger.exception("Binance WS[%d]: unexpected error", connection_id)
 
-        except ConnectionClosed as exc:
-
-            logger.warning(
-                "Binance WS[%d]: соединение закрыто: "
-                "code=%s reason=%s",
-                connection_id,
-                exc.code,
-                exc.reason,
-            )
-
-        except TimeoutError:
-
-            logger.warning(
-                "Binance WS[%d]: "
-                "таймаут при подключении",
-                connection_id,
-            )
-
-        except OSError as exc:
-
-            logger.warning(
-                "Binance WS[%d]: "
-                "сетевая ошибка: %s. "
-                "Переподключение через %d сек.",
-                connection_id,
-                exc,
-                reconnect_delay,
-            )
-
-        await asyncio.sleep(
-            reconnect_delay
-        )
-
-        reconnect_delay = min(
-            reconnect_delay * 2,
-            60,
-        )
+        await asyncio.sleep(reconnect_delay + random.uniform(0.0, 0.25))
+        reconnect_delay = min(reconnect_delay * 2.0, 30.0)
 
 
 async def run_binance_ws(
     symbols: list[str],
     price_cache: dict[str, dict[str, Price]],
 ) -> None:
-
     if not symbols:
-        logger.warning(
-            "Binance WS: нет символов для подписки"
-        )
-
         return
 
     streams = create_subscriptions(symbols)
-
     batches = [
-        streams[i:i + STREAM_BATCH_SIZE]
-        for i in range(
-            0,
-            len(streams),
-            STREAM_BATCH_SIZE,
-        )
+        streams[i : i + STREAM_BATCH_SIZE]
+        for i in range(0, len(streams), STREAM_BATCH_SIZE)
     ]
 
-    logger.info(
-        "Binance WS: всего streams=%d, "
-        "соединений=%d",
-        len(streams),
-        len(batches),
-    )
-
-    tasks = []
-
-    for connection_id, batch in enumerate(
-        batches,
-        start=1,
-    ):
-        tasks.append(
-            asyncio.create_task(
-                run_binance_connection(
-                    batch,
-                    price_cache,
-                    connection_id,
-                )
-            )
+    tasks = [
+        asyncio.create_task(
+            run_binance_connection(batch, price_cache, connection_id)
         )
+        for connection_id, batch in enumerate(batches, start=1)
+    ]
 
     try:
-
-        await asyncio.gather(
-            *tasks
-        )
-
+        await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         for task in tasks:
             task.cancel()
-
-        await asyncio.gather(
-            *tasks,
-            return_exceptions=True,
-        )
-
+        await asyncio.gather(*tasks, return_exceptions=True)
         raise

@@ -8,7 +8,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from price_feeds.orderbook_models import OrderBook
-from price_feeds.orderbook_cache import update_orderbook
+from price_feeds.orderbook_cache import update_orderbook, LazySortedLevels
 
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,7 @@ class OKXLocalOrderBook:
         self.last_received_at_ns = 0
 
         self.last_print = 0.0
+        self.common_orderbook: OrderBook | None = None
 
 
     def load_snapshot(
@@ -151,15 +152,15 @@ class OKXLocalOrderBook:
         self.events = 1
         self.synced = True
 
-        logger.info(
-            "OKX OrderBook %s: "
-            "snapshot загружен: "
-            "seqId=%d bids=%d asks=%d",
-            self.symbol,
-            self.seq_id,
-            len(self.bids),
-            len(self.asks),
-        )
+        # logger.info(
+        #     "OKX OrderBook %s: "
+        #     "snapshot загружен: "
+        #     "seqId=%d bids=%d asks=%d",
+        #     self.symbol,
+        #     self.seq_id,
+        #     len(self.bids),
+        #     len(self.asks),
+        # )
 
 
     def apply_update(
@@ -329,27 +330,26 @@ def build_common_orderbook(
             "without seq_id"
         )
 
-    return OrderBook(
-        exchange="okx",
-        symbol=orderbook.symbol,
+    if orderbook.common_orderbook is None:
+        orderbook.common_orderbook = OrderBook(
+            exchange="okx",
+            symbol=orderbook.symbol,
+            bids=LazySortedLevels(orderbook.bids, reverse=True),
+            asks=LazySortedLevels(orderbook.asks, reverse=False),
+            timestamp=orderbook.last_timestamp,
+            received_at=orderbook.last_received_at,
+            received_at_ns=orderbook.last_received_at_ns,
+            update_id=orderbook.seq_id,
+        )
+    else:
+        orderbook.common_orderbook.timestamp = orderbook.last_timestamp
+        orderbook.common_orderbook.received_at = orderbook.last_received_at
+        orderbook.common_orderbook.received_at_ns = orderbook.last_received_at_ns
+        orderbook.common_orderbook.update_id = orderbook.seq_id
+        orderbook.common_orderbook.bids.invalidate()
+        orderbook.common_orderbook.asks.invalidate()
 
-        bids=sorted(
-            orderbook.bids.items(),
-            reverse=True,
-        ),
-
-        asks=sorted(
-            orderbook.asks.items()
-        ),
-
-        timestamp=orderbook.last_timestamp,
-
-        received_at=orderbook.last_received_at,
-
-        received_at_ns=orderbook.last_received_at_ns,
-
-        update_id=orderbook.seq_id,
-    )
+    return orderbook.common_orderbook
 
 
 def publish_orderbook(
@@ -560,11 +560,11 @@ async def subscribe(
         )
     )
 
-    logger.info(
-        "OKX OrderBook %s: "
-        "отправлена подписка books",
-        symbol,
-    )
+    # logger.info(
+    #     "OKX OrderBook %s: "
+    #     "отправлена подписка books",
+    #     symbol,
+    # )
 
 
 async def run_okx_orderbook(
@@ -573,10 +573,10 @@ async def run_okx_orderbook(
 
     symbol = symbol.upper()
 
-    logger.info(
-        "OKX OrderBook %s: запуск",
-        symbol,
-    )
+    # logger.info(
+    #     "OKX OrderBook %s: запуск",
+    #     symbol,
+    # )
 
     reconnect_delay = RECONNECT_DELAY
 
@@ -590,12 +590,12 @@ async def run_okx_orderbook(
 
         try:
 
-            logger.info(
-                "OKX OrderBook %s: "
-                "подключение WS: %s",
-                symbol,
-                WS_URL,
-            )
+            # logger.info(
+            #     "OKX OrderBook %s: "
+            #     "подключение WS: %s",
+            #     symbol,
+            #     WS_URL,
+            # )
 
             async with websockets.connect(
                 WS_URL,
@@ -605,11 +605,11 @@ async def run_okx_orderbook(
                 max_size=None,
             ) as ws:
 
-                logger.info(
-                    "OKX OrderBook %s: "
-                    "WS подключен",
-                    symbol,
-                )
+                # logger.info(
+                #     "OKX OrderBook %s: "
+                #     "WS подключен",
+                #     symbol,
+                # )
 
                 reconnect_delay = (
                     RECONNECT_DELAY
@@ -632,11 +632,11 @@ async def run_okx_orderbook(
 
                     if action == "subscribe":
 
-                        logger.info(
-                            "OKX OrderBook %s: "
-                            "подписка подтверждена",
-                            symbol,
-                        )
+                        # logger.info(
+                        #     "OKX OrderBook %s: "
+                        #     "подписка подтверждена",
+                        #     symbol,
+                        # )
 
                         continue
 
@@ -660,11 +660,11 @@ async def run_okx_orderbook(
 
                     if action == "snapshot":
 
-                        logger.info(
-                            "OKX OrderBook %s: "
-                            "получен WS snapshot",
-                            symbol,
-                        )
+                        # logger.info(
+                        #     "OKX OrderBook %s: "
+                        #     "получен WS snapshot",
+                        #     symbol,
+                        # )
 
                         orderbook.load_snapshot(
                             payload
@@ -674,15 +674,15 @@ async def run_okx_orderbook(
                             orderbook
                         )
 
-                        logger.info(
-                            "OKX OrderBook %s: "
-                            "локальный стакан готов: "
-                            "update_id=%d bids=%d asks=%d",
-                            symbol,
-                            orderbook.seq_id,
-                            len(orderbook.bids),
-                            len(orderbook.asks),
-                        )
+                        # logger.info(
+                        #     "OKX OrderBook %s: "
+                        #     "локальный стакан готов: "
+                        #     "update_id=%d bids=%d asks=%d",
+                        #     symbol,
+                        #     orderbook.seq_id,
+                        #     len(orderbook.bids),
+                        #     len(orderbook.asks),
+                        # )
 
                         print_orderbook(
                             orderbook
@@ -738,12 +738,12 @@ async def run_okx_orderbook(
                 symbol,
             )
 
-        logger.info(
-            "OKX OrderBook %s: "
-            "reconnect через %d сек.",
-            symbol,
-            reconnect_delay,
-        )
+        # logger.info(
+        #     "OKX OrderBook %s: "
+        #     "reconnect через %d сек.",
+        #     symbol,
+        #     reconnect_delay,
+        # )
 
         await asyncio.sleep(
             reconnect_delay

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 import sys
 import time
 import websockets
@@ -20,9 +21,11 @@ PRODUCT_TYPE = "USDT-FUTURES"
 DISPLAY_LEVELS = 10
 
 WS_TIMEOUT = 15
+OPEN_TIMEOUT = 10
 
 RECONNECT_DELAY = 5
 MAX_RECONNECT_DELAY = 60
+RECONNECT_JITTER = 1.0
 
 PRINT_INTERVAL = 1.0
 
@@ -95,17 +98,17 @@ class BitgetLocalOrderBook:
 
         self.synced = True
 
-        logger.info(
-            "Bitget OrderBook %s: "
-            "WS snapshot загружен: "
-            "seq=%s timestamp=%s "
-            "bids=%d asks=%d",
-            self.symbol,
-            seq,
-            timestamp,
-            len(self.bids),
-            len(self.asks),
-        )
+        # logger.info(
+        #     "Bitget OrderBook %s: "
+        #     "WS snapshot загружен: "
+        #     "seq=%s timestamp=%s "
+        #     "bids=%d asks=%d",
+        #     self.symbol,
+        #     seq,
+        #     timestamp,
+        #     len(self.bids),
+        #     len(self.asks),
+        # )
 
 
     def apply_update(
@@ -615,23 +618,23 @@ async def subscribe(
         )
     )
 
-    logger.info(
-        "Bitget OrderBook %s: "
-        "отправлена подписка books",
-        symbol,
-    )
+    # logger.info(
+    #     "Bitget OrderBook %s: "
+    #     "отправлена подписка books",
+    #     symbol,
+    # )
 
 
 async def connect_ws(
     symbol: str,
 ):
 
-    logger.info(
-        "Bitget OrderBook %s: "
-        "подключение WS: %s",
-        symbol,
-        WS_URL,
-    )
+    # logger.info(
+    #     "Bitget OrderBook %s: "
+    #     "подключение WS: %s",
+    #     symbol,
+    #     WS_URL,
+    # )
 
     ws = await websockets.connect(
         WS_URL,
@@ -640,15 +643,16 @@ async def connect_ws(
         ping_timeout=None,
 
         close_timeout=5,
+        open_timeout=OPEN_TIMEOUT,
 
         max_size=None,
     )
 
-    logger.info(
-        "Bitget OrderBook %s: "
-        "WS подключен",
-        symbol,
-    )
+    # logger.info(
+    #     "Bitget OrderBook %s: "
+    #     "WS подключен",
+    #     symbol,
+    # )
 
     await subscribe(
         ws,
@@ -685,11 +689,11 @@ async def wait_for_snapshot(
 
         if action == "subscribe":
 
-            logger.info(
-                "Bitget OrderBook %s: "
-                "подписка подтверждена",
-                symbol,
-            )
+            # logger.info(
+            #     "Bitget OrderBook %s: "
+            #     "подписка подтверждена",
+            #     symbol,
+            # )
 
             continue
 
@@ -771,10 +775,10 @@ async def run_bitget_orderbook(
 
         try:
 
-            logger.info(
-                "Bitget OrderBook %s: запуск",
-                symbol,
-            )
+            # logger.info(
+            #     "Bitget OrderBook %s: запуск",
+            #     symbol,
+            # )
 
 
             ws = await connect_ws(
@@ -797,13 +801,13 @@ async def run_bitget_orderbook(
                 )
             )
 
-            logger.info(
-                "Bitget OrderBook %s: "
-                "локальный стакан готов: "
-                "seq=%s",
-                symbol,
-                orderbook.seq,
-            )
+            # logger.info(
+            #     "Bitget OrderBook %s: "
+            #     "локальный стакан готов: "
+            #     "seq=%s",
+            #     symbol,
+            #     orderbook.seq,
+            # )
 
             publish_orderbook(
                 orderbook
@@ -860,11 +864,11 @@ async def run_bitget_orderbook(
 
                 if action == "subscribe":
 
-                    logger.info(
-                        "Bitget OrderBook %s: "
-                        "подписка подтверждена",
-                        symbol,
-                    )
+                    # logger.info(
+                    #     "Bitget OrderBook %s: "
+                    #     "подписка подтверждена",
+                    #     symbol,
+                    # )
 
                     continue
 
@@ -1002,52 +1006,64 @@ async def run_bitget_orderbook(
             raise
 
 
-        except ConnectionClosed as exc:
+        except ConnectionClosed:
 
-            logger.warning(
-                "Bitget OrderBook %s: "
-                "WS закрыт: code=%s reason=%s",
-                symbol,
-                exc.code,
-                exc.reason,
-            )
+            pass
+
+
+        except (TimeoutError, OSError):
+
+            pass
+
+
+        except RuntimeError as exc:
+
+            message = str(exc)
+
+            if not (
+
+                "SEQUENCE GAP" in message
+
+                or "OUT-OF-ORDER" in message
+
+                or "snapshot" in message.lower()
+
+                or "heartbeat" in message.lower()
+
+            ):
+
+                logger.exception(
+
+                    "Bitget OrderBook %s: unexpected error",
+
+                    symbol,
+
+                )
+
 
         except Exception:
 
             logger.exception(
-                "Bitget OrderBook %s: "
-                "ошибка / sequence gap, "
-                "локальный стакан выбрасывается, "
-                "будет получен новый snapshot",
+
+                "Bitget OrderBook %s: unexpected error",
+
                 symbol,
+
             )
 
-        finally:
 
-            if ws is not None:
+        delay = reconnect_delay + random.uniform(0, RECONNECT_JITTER)
 
-                try:
-                    await ws.close()
+        await asyncio.sleep(delay)
 
-                except Exception:
-                    pass
-
-        logger.info(
-            "Bitget OrderBook %s: "
-            "reconnect через %s сек.",
-            symbol,
-            reconnect_delay,
-        )
-
-        await asyncio.sleep(
-            reconnect_delay
-        )
 
         reconnect_delay = min(
-            reconnect_delay * 2,
-            MAX_RECONNECT_DELAY,
-        )
 
+            reconnect_delay * 2,
+
+            MAX_RECONNECT_DELAY,
+
+        )
 
 async def main() -> None:
 
@@ -1091,6 +1107,19 @@ async def main() -> None:
     await run_bitget_orderbook(
         symbol
     )
+
+
+async def run_bitget_orderbooks(
+    symbols: list[str],
+) -> None:
+    tasks = [
+        asyncio.create_task(
+            run_bitget_orderbook(symbol)
+        )
+        for symbol in symbols
+    ]
+
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

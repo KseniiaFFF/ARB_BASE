@@ -2,8 +2,11 @@ import asyncio
 import json
 import logging
 import time
+
 import websockets
 
+import market_latency
+import market_events
 from price_feeds.models_price import Price
 
 
@@ -14,6 +17,7 @@ WS_URL = "wss://ws.bitget.com/v2/ws/public"
 
 SUBSCRIPTION_BATCH_SIZE = 50
 
+# Параметры переподключения
 INITIAL_RECONNECT_DELAY = 5
 MAX_RECONNECT_DELAY = 60
 
@@ -69,10 +73,10 @@ async def run_bitget_ws(
 
     args = create_subscriptions(symbols)
 
-    logger.info(
-        "Bitget WS: подключение, символов: %d",
-        len(symbols),
-    )
+    # logger.info(
+    #     "Bitget WS: подключение, символов: %d",
+    #     len(symbols),
+    # )
 
     reconnect_delay = INITIAL_RECONNECT_DELAY
 
@@ -82,9 +86,9 @@ async def run_bitget_ws(
 
         try:
 
-            logger.info(
-                "Bitget WS: попытка подключения"
-            )
+            # logger.info(
+            #     "Bitget WS: попытка подключения"
+            # )
 
             async with websockets.connect(
                 WS_URL,
@@ -94,16 +98,21 @@ async def run_bitget_ws(
                 close_timeout=5,
             ) as ws:
 
-                logger.info(
-                    "Bitget WS: соединение установлено"
-                )
+                # logger.info(
+                #     "Bitget WS: соединение установлено"
+                # )
 
+                # После успешного подключения
+                # начинаем backoff заново.
                 reconnect_delay = INITIAL_RECONNECT_DELAY
 
                 ping_task = asyncio.create_task(
                     send_ping(ws)
                 )
 
+                # -------------------------------------------------
+                # Подписка на все символы
+                # -------------------------------------------------
 
                 for i in range(
                     0,
@@ -124,21 +133,25 @@ async def run_bitget_ws(
                         json.dumps(request)
                     )
 
-                    logger.info(
-                        "Bitget WS: отправлена "
-                        "подписка %d-%d",
-                        i + 1,
-                        min(
-                            i + SUBSCRIPTION_BATCH_SIZE,
-                            len(args),
-                        ),
-                    )
+                    # logger.info(
+                    #     "Bitget WS: отправлена "
+                    #     "подписка %d-%d",
+                    #     i + 1,
+                    #     min(
+                    #         i + SUBSCRIPTION_BATCH_SIZE,
+                    #         len(args),
+                    #     ),
+                    # )
 
                     await asyncio.sleep(0.1)
 
+                # -------------------------------------------------
+                # Получение данных
+                # -------------------------------------------------
 
                 async for message in ws:
 
+                    # Bitget heartbeat response
                     if message == "pong":
                         continue
 
@@ -163,6 +176,9 @@ async def run_bitget_ws(
 
                         continue
 
+                    # -------------------------------------------------
+                    # Ошибка Bitget API
+                    # -------------------------------------------------
 
                     if data.get("event") == "error":
 
@@ -173,6 +189,9 @@ async def run_bitget_ws(
 
                         continue
 
+                    # -------------------------------------------------
+                    # Подтверждение подписки
+                    # -------------------------------------------------
 
                     if data.get("event") == "subscribe":
 
@@ -182,6 +201,10 @@ async def run_bitget_ws(
                         )
 
                         continue
+
+                    # -------------------------------------------------
+                    # Данные стакана
+                    # -------------------------------------------------
 
                     rows = data.get("data")
 
@@ -244,6 +267,7 @@ async def run_bitget_ws(
 
                             continue
 
+                        # BTCUSDT -> BTC
                         asset = symbol[:-4]
 
                         price_cache.setdefault(
@@ -262,6 +286,15 @@ async def run_bitget_ws(
                             received_at_ns=received_at_ns,
                         )
 
+                        market_latency.mark_ws_update(
+                            asset,
+                            "bitget",
+                        )
+                        market_events.mark_asset_dirty(asset)
+
+        # ---------------------------------------------------------
+        # Остановка по CancelledError
+        # ---------------------------------------------------------
 
         except asyncio.CancelledError:
 
@@ -270,6 +303,10 @@ async def run_bitget_ws(
             )
 
             raise
+
+        # ---------------------------------------------------------
+        # WebSocket закрылся
+        # ---------------------------------------------------------
 
         except websockets.exceptions.ConnectionClosed as exc:
 
@@ -280,12 +317,25 @@ async def run_bitget_ws(
                 exc.reason,
             )
 
+        # ---------------------------------------------------------
+        # Таймаут подключения
+        # ---------------------------------------------------------
+
         except TimeoutError:
 
             logger.warning(
                 "Bitget WS: таймаут подключения"
             )
 
+        # ---------------------------------------------------------
+        # Любая сетевая / системная ошибка
+        #
+        # Сюда попадёт в том числе:
+        # socket.gaierror [Errno 11001]
+        # ConnectionResetError
+        # ConnectionRefusedError
+        # OSError
+        # ---------------------------------------------------------
 
         except OSError as exc:
 
@@ -296,6 +346,9 @@ async def run_bitget_ws(
                 reconnect_delay,
             )
 
+        # ---------------------------------------------------------
+        # Остальные неожиданные ошибки
+        # ---------------------------------------------------------
 
         except Exception:
 
@@ -305,6 +358,10 @@ async def run_bitget_ws(
                 reconnect_delay,
             )
 
+        # ---------------------------------------------------------
+        # Останавливаем heartbeat после любого выхода
+        # из соединения
+        # ---------------------------------------------------------
 
         finally:
 
@@ -320,16 +377,23 @@ async def run_bitget_ws(
 
                     pass
 
+        # ---------------------------------------------------------
+        # Пауза перед переподключением
+        # ---------------------------------------------------------
 
-        logger.info(
-            "Bitget WS: переподключение через %d секунд",
-            reconnect_delay,
-        )
+        # logger.info(
+        #     "Bitget WS: переподключение через %d секунд",
+        #     reconnect_delay,
+        # )
 
         await asyncio.sleep(
             reconnect_delay
         )
 
+        # Экспоненциальный backoff:
+        #
+        # 5 -> 10 -> 20 -> 40 -> 60 -> 60...
+        #
 
         reconnect_delay = min(
             reconnect_delay * 2,

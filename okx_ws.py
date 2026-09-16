@@ -5,6 +5,8 @@ import time
 
 import websockets
 
+import market_events
+
 from price_feeds.models_price import Price
 
 
@@ -47,10 +49,10 @@ async def run_okx_ws(
 
     args = create_subscriptions(symbols)
 
-    logger.info(
-        "OKX WS: подключение, символов: %d",
-        len(symbols),
-    )
+    # logger.info(
+    #     "OKX WS: подключение, символов: %d",
+    #     len(symbols),
+    # )
 
     reconnect_delay = INITIAL_RECONNECT_DELAY
 
@@ -58,9 +60,9 @@ async def run_okx_ws(
 
         try:
 
-            logger.info(
-                "OKX WS: попытка подключения"
-            )
+            # logger.info(
+            #     "OKX WS: попытка подключения"
+            # )
 
             async with websockets.connect(
                 WS_URL,
@@ -70,9 +72,9 @@ async def run_okx_ws(
                 close_timeout=5,
             ) as ws:
 
-                logger.info(
-                    "OKX WS: соединение установлено"
-                )
+                # logger.info(
+                #     "OKX WS: соединение установлено"
+                # )
 
                 reconnect_delay = INITIAL_RECONNECT_DELAY
 
@@ -96,15 +98,15 @@ async def run_okx_ws(
                         json.dumps(request)
                     )
 
-                    logger.info(
-                        "OKX WS: отправлена "
-                        "подписка %d-%d",
-                        i + 1,
-                        min(
-                            i + SUBSCRIPTION_BATCH_SIZE,
-                            len(args),
-                        ),
-                    )
+                    # logger.info(
+                    #     "OKX WS: отправлена "
+                    #     "подписка %d-%d",
+                    #     i + 1,
+                    #     min(
+                    #         i + SUBSCRIPTION_BATCH_SIZE,
+                    #         len(args),
+                    #     ),
+                    # )
 
                     await asyncio.sleep(0.1)
 
@@ -229,6 +231,7 @@ async def run_okx_ws(
                             received_at=received_at,
                             received_at_ns=received_at_ns,
                         )
+                        market_events.mark_asset_dirty(asset)
 
 
         except asyncio.CancelledError:
@@ -276,10 +279,10 @@ async def run_okx_ws(
             )
 
 
-        logger.info(
-            "OKX WS: переподключение через %d секунд",
-            reconnect_delay,
-        )
+        # logger.info(
+        #     "OKX WS: переподключение через %d секунд",
+        #     reconnect_delay,
+        # )
 
         await asyncio.sleep(
             reconnect_delay

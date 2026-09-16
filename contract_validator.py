@@ -23,10 +23,10 @@ def get_valid_binance_contracts() -> dict[str, Contract]:
     try:
         contracts = get_binance_contracts()
 
-        logger.info(
-            "Binance: получено контрактов: %d",
-            len(contracts)
-        )
+        # logger.info(
+        #     "Binance: получено контрактов: %d",
+        #     len(contracts)
+        # )
 
         valid_contracts = {}
 
@@ -101,10 +101,10 @@ def get_valid_binance_contracts() -> dict[str, Contract]:
                 qty_step=qty_step,
             )
 
-        logger.info(
-            "Binance: действующих USDT perpetual контрактов: %d",
-            len(valid_contracts)
-        )
+        # logger.info(
+        #     "Binance: действующих USDT perpetual контрактов: %d",
+        #     len(valid_contracts)
+        # )
 
         return valid_contracts
 
@@ -121,10 +121,10 @@ def get_valid_bitget_contracts() -> dict[str, Contract]:
     try:
         contracts = get_bitget_contracts()
 
-        logger.info(
-            "Bitget: получено контрактов: %d",
-            len(contracts)
-        )
+        # logger.info(
+        #     "Bitget: получено контрактов: %d",
+        #     len(contracts)
+        # )
 
         valid_contracts = {}
 
@@ -179,10 +179,10 @@ def get_valid_bitget_contracts() -> dict[str, Contract]:
                 qty_step=qty_step,
             )
 
-        logger.info(
-            "Bitget: действующих USDT perpetual контрактов: %d",
-            len(valid_contracts)
-        )
+        # logger.info(
+        #     "Bitget: действующих USDT perpetual контрактов: %d",
+        #     len(valid_contracts)
+        # )
 
         return valid_contracts
 
@@ -199,10 +199,10 @@ def get_valid_okx_contracts() -> dict[str, Contract]:
     try:
         contracts = get_okx_contracts()
 
-        logger.info(
-            "OKX: получено контрактов: %d",
-            len(contracts)
-        )
+        # logger.info(
+        #     "OKX: получено контрактов: %d",
+        #     len(contracts)
+        # )
 
         valid_contracts = {}
 
@@ -258,10 +258,10 @@ def get_valid_okx_contracts() -> dict[str, Contract]:
                 qty_step=qty_step,
             )
 
-        logger.info(
-            "OKX: действующих USDT perpetual контрактов: %d",
-            len(valid_contracts)
-        )
+        # logger.info(
+        #     "OKX: действующих USDT perpetual контрактов: %d",
+        #     len(valid_contracts)
+        # )
 
         return valid_contracts
 
@@ -335,12 +335,12 @@ def update_all_market_status(
             for market in markets
         )
 
-        logger.info(
-            "%s: активных Market: %d из %d",
-            exchange,
-            active_count,
-            len(markets)
-        )
+        # logger.info(
+        #     "%s: активных Market: %d из %d",
+        #     exchange,
+        #     active_count,
+        #     len(markets)
+        # )
 
 
 if __name__ == "__main__":
